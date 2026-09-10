@@ -1,0 +1,39 @@
+# ---------------------------------------------------------------------------
+# 运行数据、日志、回放、凭据 —— 一律不纳入版本控制
+# 注意：data/ 内含 tokens.txt / xuanwu_token.txt / portal_session.json
+#       （真实 token 与登录 cookie 明文），切勿提交。
+# ---------------------------------------------------------------------------
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# 测试 / 覆盖率
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+
+# 编辑器 / 操作系统
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 本地临时文件
+*.tmp
+*.bak
+*.orig

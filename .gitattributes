@@ -1,0 +1,12 @@
+# 仓库内统一存 LF，工作区按平台自动转换
+* text=auto
+
+*.py   text diff=python
+*.md   text
+*.json text
+*.tsv  text
+*.txt  text
+
+*.png  binary
+*.jpg  binary
+*.log  text

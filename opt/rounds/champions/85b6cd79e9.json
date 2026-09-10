@@ -1,0 +1,31 @@
+{
+ "genome": {
+  "use_chi": true,
+  "use_peng": true,
+  "use_gang": true,
+  "fast": true,
+  "dealer_aware": false,
+  "use_ev": true,
+  "peng_ukeire_gate": false,
+  "chi_ukeire_gate": false,
+  "peng_gate_max_shanten": null,
+  "piao_enabled": true,
+  "piao_dealer_only": false,
+  "baotou_slack": 1,
+  "baotou_max_shanten": 1,
+  "defend_dealer": false,
+  "defend_pen": 40.0,
+  "defend_window": null,
+  "defend_hot_max": 1,
+  "defend_mode": "suit",
+  "fan_est": "heuristic",
+  "angang_tenpai_only": true,
+  "protect_gang": true,
+  "knock": false,
+  "ycb_escape_gap": 0,
+  "dealer_policy": "aggr"
+ },
+ "version_id": "85b6cd79e9",
+ "promoted_at_round": "r_initial",
+ "note": "初始: EV开+坐庄抢速aggr"
+}

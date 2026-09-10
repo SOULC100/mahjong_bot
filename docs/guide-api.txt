@@ -1,0 +1,230 @@
+URL: https://10.240.169.190:18080/portal/#guide-api
+
+> ⚠️ 2026-09-04 快照：本文为静态抓取，实时规则已到 v11。**注意**：v2 起快照已移除 allowed_actions（客户端自研动作判定，见 roadmap §5）；state 轮询限速已放宽到 16/s（v11，历次上限 5/s → 8/s → 16/s）；v7 普通锦标赛多阶段化（stage_open/stage_done、跨阶段 ready=出席确认+NOT_QUALIFIED、决赛加赛）；v9 测试房数据 API 限速 per-IP→per-房间；v10 /state 跨局边界立即回全量快照。以 GET /portal/api/guide/version 为准。
+
+杭州麻将对战平台
+刘斌
+退出
+赛事大厅
+我的赛事
+测试房间
+接入指南
+接入指南
+规则 · API 参考 · 最小 Bot
+对战规则
+API 参考
+最小 Bot
+一、对战规则
+1.1 平台固有规则（所有锦标赛一致）
+牌具：136 张（万/筒/条 1-9 各 4 张 + 东南西北中发白各 4 张），无花牌；白板 = 财神（百搭），可替代任意牌。
+财神限制：财神本身不能被吃、碰、杠、胡，可主动打出；打出财神那一圈（抓打圈）：其余玩家不能吃、碰、明杠（仅暗杠与自摸胡），出牌只能打刚摸到的牌。
+胡牌：只能自摸，不允许点炮；禁止抢杠胡。
+连庄：直上三连庄——首局即按 ×8 计（不从平庄 ×2、二连庄 ×4 递增）；流局庄家连庄。
+牌墙：最后 10 墩（20 张）保留不摸；最后 10 墩之内禁止杠牌；摸完无人胡则流局。
+吃碰：吃最多 2 摊；碰、杠不限次数；碰（含明杠）窗口先于吃窗口。
+1.2 番型倍率（在自摸基础上连乘）
+番型	说明	倍率
+平胡	普通自摸胡，无财神特殊状态	×1
+爆头	4 搭成型，手里剩 1 张财神单吊，摸任意牌都胡	×2
+杠开	杠后补的那张牌直接自摸胡（杠上花）	×2
+杠爆	爆头状态下杠，杠补牌胡（杠开 + 爆头）	×4
+财飘	爆头状态、手里 2 张财神，主动打出 1 张财神，继续听任意牌胡	×4
+双财飘	连续两次打出财神再爆头胡	×8
+三财飘	连续三次打出财神再爆头胡	×16
+七对子	7 对胡牌	×2
+豪华七对	含一组四张相同，充当两个对子	×4
+4 个白板	胡牌时手中持有 4 张白板（财神）	×2
+番型连乘（如 4 白板爆头 = ×2×2）；杠飘 / 飘杠为杠 + 财飘组合，叠加计算；连杠、飘每多一次 ×2。
+财飘一旦中间没有胡，下一轮飘财状态直接消失，恢复普通打牌。
+七对也可以爆头（七客 / 豪华七客）。
+1.3 计分公式
+
+得分 = 底分 × 胡牌番型倍率 ×（庄家 ×8 / 闲家 ×1），三家分别结算：
+
+庄家胡：三家闲家各付 底分 × 倍率 × 8
+闲家胡：庄家付 底分 × 倍率 × 8；另外两个闲家各付 底分 × 倍率 × 1
+1.4 锦标赛可变参数（以 API 返回为准，不可写死）
+注意：底分、局数、同时场数 M、有财必拷响、碰/吃/出牌窗口等由创建者配置，每场锦标赛可能不同——机器人必须以 GET /api/tournaments/me/rules（或 GET /api/tournaments/{id}）返回的 config 为准。
+
+参赛令牌（报名令牌）作用域直达，无需知道锦标赛 id：
+
+GET /api/tournaments/me/rules
+Authorization: Bearer <参赛令牌>
+
+响应示例：
+
+{
+  "tournament_id": "t_xxx_b0",
+  "name": "测试房间 #1",
+  "status": "registering",
+  "config": {
+    "M": 10, "Rounds": 1, "BaseScore": 1,
+    "YouCaiBiKao": false,
+    "PengTimeoutSec": 1, "ChiTimeoutSec": 1, "DiscardTimeoutSec": 3,
+    "StartAt": 1756656000, "RegisterDeadlineAt": 0
+  }
+}
+
+config 字段含义：
+
+字段	含义
+M	每人同时参赛场数上限（该锦标赛内）
+Rounds	每场比赛的局数
+BaseScore	底分（计分公式的底分）
+YouCaiBiKao	有财必拷响（手上有财神时不允许平胡，必须爆头/杠开才能胡）
+PengTimeoutSec	碰窗口（默认 1s，固定走满防时间侧信道）
+ChiTimeoutSec	吃窗口（默认 1s，固定走满）
+DiscardTimeoutSec	出牌思考（默认 3s，超时自动打出最右一张牌）
+StartAt	开赛时间（unix 秒）
+RegisterDeadlineAt	报名截止（unix 秒；0 = 无截止）
+二、API 参考（玩家 API）
+
+认证：所有玩家 API 均需请求头 Authorization: Bearer <参赛令牌>。令牌来源：门户「报名」或「测试房间」派发（仅显示一次，请立即复制）；服务端只存令牌的 SHA-256，丢失只能重新生成。例外：§2.4 的测试房间数据 API 免认证（房间 id 即凭证，仅 IP 限速）。
+
+端点	方法	用途
+/api/users	POST	注册：创建用户，返回 user_id + 全局 token（每 IP 10 次/小时）。全局 token 未绑定锦标赛，须自带锦标赛 id 参赛
+/api/me	GET	我的信息：user_id + 令牌绑定的 tournament_id（报名令牌；全局令牌为空串）+ 进行中比赛列表 active_games
+/api/tournaments/me/rules	GET	当前令牌绑定锦标赛的规则 config（报名令牌直达，无需锦标赛 id；全局令牌返回 400 TOKEN_NOT_SCOPED）
+/api/tournaments/me/ready	POST	到位（报名令牌直达；全局令牌返回 400 TOKEN_NOT_SCOPED）
+/api/tournaments/{id}/register	POST	报名（开赛前；幂等；校验同时 16 场上限）
+/api/tournaments/{id}/ready	POST	到位（开赛前；幂等；须先报名）
+/api/tournaments/{id}	GET	锦标赛状态：status / config / 报名与 ready 人数 / 我的比赛 / 实时排名 / voided 原因（仅参赛者可查）
+/api/games/{id}/state?seq=N	GET	长轮询状态与事件流：seq=0 返回全量快照（含你的手牌与 allowed_actions）；seq=N 返回 N 之后的新事件；无新事件时挂起最多 30s 后返回 {"pending":true}
+/api/games/{id}/action	POST	提交动作：{"action":"discard|chi|peng|gang|hu|pass","tile":"1w"}——必须严格按 allowed_actions 提交，否则 409 INVALID_ACTION
+/api/test-rooms/{id}/games	GET	测试房间局列表（免认证）：[{batch, game_id, status}]，batch 升序——打完房间后拉取全量数据的入口
+/api/test-rooms/{id}/games/{batch}/events	GET	该局完整对战事件流（免认证）：blocks 分块（含四家手牌）+ rounds 局结果——赛后拉取用于算法优化；running 场次 403，房间删除后 404
+2.1 协议要点（AI 接入必读）
+快照规范：seq=S 的响应已包含全部 ≤S 的事件，快照是规范真相；客户端局面 = 快照 + 后续增量事件（事件带自身 seq，校验连续性）。
+失步恢复：发现缺口（响应含 gap:true）或动作 409 后，用 seq=0 重建全量快照。
+私有信息：事件流只含自己的摸牌；他人手牌绝不出现。
+超时兜底：出牌思考超时自动打出最右一张牌；碰/吃窗口固定走满（防时间侧信道）——AI 无响应比赛不会卡死，但积分损失不可避免。
+2.2 身份与限制
+限制	数值
+每用户同时参赛场数（含挂起）	≤ 16
+state 轮询频率	16 次/秒
+每用户并发挂起轮询	≤ 32
+注册频率	10 次/小时/IP
+2.3 常见错误码
+状态码	错误码	含义
+400	TOKEN_NOT_SCOPED	全局令牌调用 /me/rules、/me/ready（需报名令牌）
+401	UNAUTHORIZED	token 无效或已吊销
+403	FORBIDDEN	非该场参赛者 / 非参赛者查询他人锦标赛
+403	GAME_NOT_FINISHED	数据 API 拉取进行中场次（对局内禁实时数据，防作弊）
+404	TOURNAMENT_NOT_FOUND / GAME_NOT_FOUND	锦标赛 / 房间不存在
+409	INVALID_ACTION	动作不合法——只按 allowed_actions 提交即可规避
+409	TOURNAMENT_STARTED	开赛后报名 / ready
+409	MATCH_LIMIT_REACHED	已达同时 16 场上限
+429	RATE_LIMITED	轮询超频 / 并发挂起超限 / 注册限速
+2.4 赛后数据（事件流 API，免认证）
+测试房间结束后（finished/void/closed），用房间 id 即可拉取完整对战事件流（含四家开局手牌与逐事件摸/打/吃碰杠），供离线复盘与算法优化。
+流程：先 GET /api/test-rooms/{id}/games 拿局列表（batch 序）→ 按 batch 逐个 GET /api/test-rooms/{id}/games/{batch}/events 拉取。
+房间 id 即凭证——请勿公开分享；仅限速（每房间 5/s + 兜底每来源 1000/s，v9 起）；响应 Cache-Control: no-store 勿缓存。
+进行中场次（running）返回 403 GAME_NOT_FINISHED；房间或 batch 不存在 404；房间删除后数据级联清除（404）。
+三、最小 Bot（复制即用，无策略）
+
+以下脚本只演示协议循环，不含任何牌技：令牌 → 发现锦标赛 → 报名/到位 → 等开赛 → 长轮询 → 严格按 allowed_actions 行动（能胡就胡、出牌打第一张、其余过）。保存为 my_bot.py，在「测试房间」创建后拿到参赛令牌直接运行：
+
+python my_bot.py <参赛令牌>
+
+自测用全局令牌（POST /api/users 注册所得）时需显式带锦标赛 id：python my_bot.py <token> <锦标赛id>。替换其中的决策分支（"提交:" 前的 if/else）即可接入你自己的牌技。
+
+#!/usr/bin/env python3
+"""最小示例 Bot —— 杭州麻将对战平台 AI 接入模板（纯标准库，零依赖，无策略）。
+
+只演示协议循环：令牌 -> 发现锦标赛 -> 报名/到位 -> 等开赛 -> 长轮询
+-> 严格按 allowed_actions 行动（能胡就胡、出牌打第一张、其余过）。
+"""
+import json
+import ssl
+import sys
+import time
+import urllib.request
+
+if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # Windows 控制台兜底
+
+SERVER = "https://10.240.169.190:18080"  # 部署实例（自签证书）；本地调试改 http://localhost:8080
+TOKEN = sys.argv[1] if len(sys.argv) > 1 else "PASTE_TOKEN_HERE"
+
+
+class ApiError(Exception):
+    def __init__(self, status, body):
+        self.status, self.body = status, body
+
+
+def api(method, path, body=None):
+    """带 Bearer 认证的 JSON 请求；429 退避重试，其余 HTTP 错误抛 ApiError。"""
+    req = urllib.request.Request(
+        SERVER.rstrip("/") + path,
+        data=json.dumps(body).encode() if body is not None else None,
+        method=method)
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Authorization", "Bearer " + TOKEN)
+    ctx = ssl._create_unverified_context()  # 部署实例为 caddy 自签证书，跳过校验
+    try:
+        with urllib.request.urlopen(req, timeout=35, context=ctx) as r:
+            return json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            time.sleep(2)
+            return api(method, path, body)
+        raise ApiError(e.code, e.read().decode(errors="replace"))
+
+
+# 1) 令牌发现锦标赛（报名令牌作用域直达；全局令牌用 argv[2] 显式指定）
+me = api("GET", "/api/me")
+tid = me["tournament_id"] or (sys.argv[2] if len(sys.argv) > 2 else "")
+if not tid:
+    raise SystemExit("令牌未绑定锦标赛：请用门户「报名」或「测试房间」派发的参赛令牌（自测可用 python my_bot.py <token> <锦标赛id>）")
+print("锦标赛:", tid)
+
+# 2) 进场：报名（幂等）-> 到位（幂等）-> 等开赛
+api("POST", "/api/tournaments/%s/register" % tid)
+api("POST", "/api/tournaments/%s/ready" % tid)
+while True:
+    st = api("GET", "/api/tournaments/%s" % tid)["status"]
+    if st == "running":
+        break
+    if st in ("void", "closed"):
+        raise SystemExit("锦标赛未开赛已终止: " + st)
+    time.sleep(1)
+print("开赛")
+
+
+def play(gid):
+    """单场主循环：长轮询 -> 有 allowed_actions 即行动。"""
+    seq = 0
+    while True:
+        res = api("GET", "/api/games/%s/state?seq=%d" % (gid, seq))
+        if res.get("finished"):
+            print("本场结束，积分:", (res.get("snapshot") or {}).get("scores"))
+            return
+        if res.get("pending"):      # 30s 内无新事件：继续挂起
+            continue
+        snap = res.get("snapshot")
+        if snap is None:            # 增量事件：推进 seq 后重拉权威快照
+            for ev in res.get("events") or []:
+                seq = ev.get("seq", seq)
+            snap = api("GET", "/api/games/%s/state?seq=0" % gid).get("snapshot")
+        else:
+            seq = res.get("seq", seq)
+        allowed = snap.get("allowed_actions") or []
+        if not allowed:             # 他人回合，继续轮询
+            continue
+        if "hu:" in allowed:        # 能胡就胡
+            act = {"action": "hu", "tile": ""}
+        else:                       # 出牌打第一张；碰/吃/杠窗口一律过
+            d = [a.partition(":")[2] for a in allowed if a.startswith("discard:")]
+            act = {"action": "discard", "tile": d[0]} if d else {"action": "pass", "tile": ""}
+        print("提交:", act)
+        try:
+            api("POST", "/api/games/%s/action" % gid, act)
+        except ApiError as e:
+            if e.status != 409:     # 409 = 动作已失效（竞态）：重建快照后重试
+                raise
+        seq = 0                     # 动作后重建快照，避免状态漂移
+
+
+for g in api("GET", "/api/me")["active_games"]:
+    play(g["game_id"])
+print("全部完成")
