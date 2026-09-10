@@ -1,6 +1,7 @@
 # mahjong_bot 后续规划：提高胡牌率与胜率
 
-> 更新时间：2026-09-02。基线：离线模拟器 smart vs 3 随机 baseline ≈ 55% 胡牌率 / +13 平均分。
+> 更新时间：2026-09-10。基线：离线模拟器 smart vs 3 随机 baseline ≈ 55% 胡牌率 / +13 平均分。
+> **注意（2026-09-10）**：v21① 白板口径修正改动了七对分支倍率（见 §5），旧基线数值需重跑后再引用。
 
 ## 0. 现状与关键事实（已实证）
 
@@ -72,36 +73,103 @@
 1. 所有策略改动先在 `sim_ab.py` 跑 A/B（相同牌墙、隔离开关），拿胡牌率 + 平均分。
 2. 胡牌率改动看「胡牌率」列；胜率改动看「平均分」列（含番型/庄家计分）。
 3. 上线前用真实 test room 跑几局烟测（`sim_run.py` + 线上 `smart_bot.py`）。
+4. **番型/规则口径改动**：改 `mahjong/fan.py` 或 `sim/engine.py` 判据时，先与免认证
+   `POST /portal/api/tools/fan-calc` 对拍（`python data/_probe_fancalc.py`），把权威期望值写进
+   `tests/test_fan.py`，再谈胜率——口径错会让 sim 的"证伪/晋级"结论整体失真（v21 就吃过，见 §5.3 A/B）。
+5. `python tests/test_smart_bot.py` 覆盖协议层回归（YCB 判胡、吃摊 ≤2、抓打圈豁免、`play()` 假 api 全链路），改动 `smart_bot.py` 后必跑。
+6. 上线 bot 启动会做 `guide/version` 自检；日志出现「⚠️ 服务器接入指南 vN > 本代码已知 vM」时先核 breaking 再跑比赛。
+7. **真机联调（改完必跑）**：`python create_room.py`（4 令牌）→ `python live_smoke.py`（并发 4 bot 打完一轮 + 归档 + 日志关键字扫描）
+   → `python verify_live.py <归档目录>`（吃摊 ≤2 / 抓打圈圈内合规 / 番型与服务器 `fan` 及 fan-calc 三方对拍）。
+   验收线：bot 日志 0 Traceback/0 线程异常/0 409/0 张数守恒异常、出牌超时率 0%、番型对拍全 OK、违规计数 0。
 
-## 5. 2026-09 规则更新（重要，以 GET /portal/api/guide/version 为准）
+## 5. 2026-09 规则更新（**已到 v30**，2026-09-10 live 核对；以 GET /portal/api/guide/version 为准）
 
-**免认证番型端点**：`POST /portal/api/tools/fan-calc`（每 IP 10/s），入参 `{hand:[13张], draw:"<单张>", chain:{count,piao}, base}`（**draw 是单张字符串，不是数组**），返回 `{hu, baotou, fan, detail, scores}`。2026-09-03 已用其对拍 fan.py（青龙手 fan=4、真爆头 ×2、七客 ×4、三财飘+4白板+爆头 ×32，全一致）；v6 已修 4白板 链内飘出 + chain.count 上限 0-6。
+> 全量变更日志：`data/guide_version_changes.txt`（54 条 detail）；权威正文：`docs/guide-v30.txt`
+> （= `GET /portal/api/guide?format=text`，取代旧的 guide-api.txt / guide-rules.txt v11 静态快照）。
+> 版本自检：`smart_bot.py` 启动时比对 `KNOWN_GUIDE_VERSION = 30`（指南 §2.2 推荐做法）。
+> 真机实测：v30 是本地联调当天发布的——4 个 bot 启动即打出「⚠️ 服务器接入指南 v30 > 本代码已知 v29」，
+> 这正是自检要起的作用；核对 v30 详情（仅姓名字段）后把基准提到 30，重跑烟测输出变为 ok。
 
-**规则版本已到 v11（2026-09-04 live 核对）**：v7(breaking)=普通锦标赛**多阶段化**（海选→16/8强→决赛）：顶层 status 新增 `stage_open/stage_done`、`ready` 跨阶段=出席确认（新错误码 `NOT_QUALIFIED`）、ranking 当阶段累计 + 新增 `place_points/god_count`、决赛平局自动加赛（新 `game_id` 静默出现）→ **smart_bot 主循环已多阶段化**（见 §6：running 动态扫 active 并发打场、stage_open 出席确认、NOT_QUALIFIED 即退出、循环至 finished/closed/void）。v8=仅门户 description/改名，无 bot 影响。v9=测试房数据 API 限速 per-IP → per-房间（影响 fetch_room_stats/analyze_room 等取证脚本，无破坏）。v10=/state 跨局边界 seq 落后当前局立即回全量快照（事件驱动与快照轮客户端均无需改动）。v11=state 轮询限速 8/s → 16/s（per-user 聚合；smart_bot 自限 ~12.5/s 留余量）。v2 已移除 allowed_actions（见下 API 变更，docs/guide-rules.txt 里"含 allowed_actions"的旧文需注意）。
+**免认证番型端点**：`POST /portal/api/tools/fan-calc`（每 IP 10/s），入参 `{hand:[13张], draw:"<单张>", chain:{count,piao}, base}`（**draw 是单张字符串，不是数组**），返回 `{hu, baotou, fan, detail, scores}`。对拍脚本：`data/_probe_fancalc.py`（当前 5/5 一致）；对拍结论已固化为 `tests/test_fan.py` 的 v21 用例；真机 20 局又做了三方对拍（见 §5.7）。
 
-**番型规则**（`mahjong/fan.py` 已对齐）：
-- 爆头：摸任意牌即胡（含七客=6对+财神；手牌 4 白板不算爆头）
-- 豪华七对 ×4 / 双豪华 ×8 / 三豪华 ×16
+### 5.1 v1–v11（历史，早期已对齐）
+
+v2(breaking) 快照移除 `allowed_actions`（客户端自研判定）+ 快照加 `seat` + chi 支持 `tiles`；v1(breaking) 碰后禁胡；v1 番数体系重构（总番=分支 × 2^链 × 4白板 × 爆头）；v3 七对允许财飘（全局最大 ×512）；v2/v11 state 轮询 5/s→8/s→**16/s**；v6 fan-calc 修 4白板链内飘出 + chain 0-6；v7(breaking) 普通锦标赛多阶段化；v9 测试房数据 API 限速 per-IP→per-房间；v10 /state 跨局边界立即回全量快照。
+
+### 5.2 v12–v30 变更（本轮审计结果）
+
+**影响 bot 行为的 breaking**
+
+| 版本 | 内容 | 代码现状 |
+|------|------|---------|
+| v13 | 分桌实到 = 开赛时刻「已确认 ∧ 90s 内已认证请求在线」；`/api/match` 全自动入席（auto 房唯一入口）；409 `AUTO_MATCH_ONLY`/`MATCH_BUSY`/`MATCH_LIMIT_REACHED`；auto 房 finished 宽限 60s 后关停 → 玩家 API 一律 404 | 主循环 1s 轮询满足在线要求 ✅；404 优雅收场 ✅；**已补 `/api/match` 客户端** ✅ |
+| v15 | `/api/match` 服务默认 M=1/Rounds=2 → **M=10/Rounds=8**；显式上限低于默认 → 永久 404 `NO_ROOM_AVAILABLE` | 本地先拒绝 `--m<10`/`--r<8` ✅；M≥8 时轮询自限提到 ≈13.3/s ✅ |
+| v24 | 删除 `POST /api/users`（匿名注册）；存量匿名全局令牌 match/register → 403 `PORTAL_BINDING_REQUIRED` | 按 code 判型、给出门户取令牌提示 ✅ |
+| v25 | **吃最多 2 摊服务端强制**（第 3 次 chi → 409 `INVALID_ACTION`）；吃摊数 = `melds[seat]` 中 `kind=="chi"` 组数 | `GameState.chi_meld_count()` + `choose_action` 本地自限 ✅ |
+| v29 | 全服开关：关自由匹配/自建测试房后 → 403 `FEATURE_DISABLED`（含 test 房「重开下一轮」，此前是 409）；新增免认证 `GET /portal/api/features` | 入场 403 不杀进程 ✅；match 前查 `features` ✅ |
+
+**规则/番型口径（changed）**
+
+- **v21①** 七对「豪华组」：4 张真白板**已用于补落单**时不再额外计 1 组四张（×8→×4）；其余牌全为自然对、白板两两自配时仍计。**实测差异**：`1w×4 2w×4 5w 6w + 白×4` 旧码 ×64、权威端点 ×32。
+- **v21②** 爆头：撤销「正好 4 张白板不算爆头」，4 白听任意即胡按爆头计并与「4 个白板 ×2」叠加。**实测差异**：`1w1w…4w4w5w5w + 白×4` 旧码 ×8、权威端点 ×16。
+- **v26** 抓打圈**豁免方**：圈内打财神者本人可吃/碰/明杠/补杠且出牌不受限；圈内非财神出牌只对豁免方开响应窗口；快照 `god` 新增 `god_discarder_seat`（无圈 = -1）；受限 ⇔ `catch_play && god_discarder_seat != seat`。
+
+**纯加性 / 无影响**：v12 SSE `GET /api/games/{id}/notify`（可选，不占 16/s 额度）、v14 `GET /portal/api/guide`、v16 无、v17/v20/v22/v23/v27/v28 门户-only、v18 auto 房 seats 只下昵称、v19 `round_ended` 加 `round_no/dealer`。
+
+### 5.3 2026-09-10 代码修复（本轮已落地）
+
+| # | 位置 | 修复 |
+|---|------|------|
+| A | `mahjong/fan.py::seven_pairs_branch` | v21① 白板补单不再计豪华组 |
+| B | `mahjong/fan.py::any_draw_win`（新）+ `sim/engine.py::_any_draw_win` | v21② 撤 4 白板排除；爆头判据收敛为一处共享函数 |
+| C | `mahjong/fan.py::ycb_can_hu`（新）+ `smart_bot.can_hu` | **致命 bug**：旧判据 `shanten_baotou(hand) != -1` 对 14 张恒真 → YCB 赛事持财神的胡全被拒、直接出牌打掉；现按「真·爆头 or 杠开」，杠开窗口由 `gang_kai_armed` 跟踪 |
+| D | `mahjong/game_state.py::chi_meld_count` + `smart_bot.choose_action` | v25 吃摊 ≤2 本地自限（旧格式解析不出则交服务端 409 兜底） |
+| E | `mahjong/game_state.py::is_catch_restricted` + `smart_bot.choose_action` | v26 豁免方可吃/碰/任意出牌；另放开圈内暗杠（规则只禁吃/碰/**明**杠） |
+| F | `smart_bot.py::_err_code` | 一律按响应体 `{"code":...}` 判型；403（v24/v29）、404（v13 auto 房关停）、401 均不再杀进程 |
+| G | `smart_bot.py::match_room/check_match_enabled` | 全局令牌走 `POST /api/match`：永久条件直接退出并提示，瞬态退避重试；auto 房按 `my_games` 过滤在途场、终态判定等线程收尾 |
+| H | `smart_bot.py::check_guide_version` | 启动拉 `guide/version` 比对 `KNOWN_GUIDE_VERSION`，列出新增 breaking |
+
+### 5.4 尚未做的规则对齐（已知缺口）
+
+- **sim 未建模抓打圈**（`sim/engine.py` 无 `catch_play`/`god_discarder_seat`）：财飘/打财神的收益在模拟器里被高估（§2 B1「财飘证伪」的结论受此影响），需要建模后重验。
+- **线上只做暗杠**：明杠需响应他人弃牌窗口、补杠需解析 `melds` 里的杠/碰类型（历史死循环风险），暂缓。
+- `decision._fan_ting_expect` 调 `calc_fan` 不传 `baotou`（仅 `fan_est=real*` 路径用到，B4 已证伪）。
+- 抓到 v30+ 时的应对：版本自检已就位，发现 breaking 先看 `detail` 再动代码。
+
+
+### 5.5 番型 / 抓打圈口径（代码对齐基准）
+
+**番型规则**（`mahjong/fan.py` 已对齐 v21）：
+- 爆头：摸任意牌即胡（含七客=6对+财神；**v21② 起正好 4 张白板也算**——4 白听任意即胡按爆头计且与「4 个白板 ×2」叠加）
+- 豪华七对 ×4 / 双豪华 ×8 / 三豪华 ×16；**v21①：4 张真白板仅在其余牌全为自然对（白板两两自配、未用于补落单）时才算 1 组四张**
 - **v3：七对允许财飘**（撤销「不能财飘」）——七对形爆头听牌可弃胡打白飘，飘/杠链与七对分支连乘
 - 总番公式：`分支因子 × 2^动作链 × (4白板×2) × (爆头×2)`
 - 4白板：**手留 + 链内飘出的白板 = 4**（白板共4张；普通打出/杠出不算）
 - 动作链：飘/杠每个动作 ×2，可组合；打出非飘非杠牌则链断
 - **最大牌型 ×512** = 三豪华七对×16 × 三财飘×8 × 4白板×2 × 爆头×2
 
+**抓打圈（v26）**：圈内**打财神者本人豁免**（可吃/碰/明杠/补杠、可任意出牌；吃碰后再打财神 = 财飘链 +1 且圈以本人重启，打别的牌 = 链断且圈解除）；其余三家仍禁吃/碰/明杠、只能打刚摸的牌，暗杠与自摸胡照常。快照 `god.god_discarder_seat`（无圈 = -1）；**受限 ⇔ `catch_play && god_discarder_seat != seat`**。
+
+### 5.6 v2 协议要点（客户端自研动作判定）
+
 **API 变更（v2 breaking，影响 smart_bot.py）**：
-- **快照移除 `allowed_actions`**——客户端须依 `seat/phase/turn/responding_seats/drawn_tile/god.catch_play` 自研判定动作（phase ∈ deal|draw|response_peng|response_chi|settled|finished）
+- **快照移除 `allowed_actions`**——客户端须依 `seat/phase/turn/responding_seats/drawn_tile/melds/god` 自研判定动作（phase ∈ deal|draw|response_peng|response_chi|settled|finished）
 - 快照新增 `seat`（本人座位 0-3）——解决此前 my_seat 无法获取的问题
 - chi 可附加 `"tiles":["1w","2w"]` 指定吃组合（缺省回退第一组）
 - **碰后禁止胡牌**（v1）：碰/吃/杠后、摸牌前提交 hu 返回 409，须先等摸牌
-- state 轮询限速：5/s → 8/s（v1）→ **16/s（v11）**，smart_bot 自限 ~12.5/s
+- state 轮询限速：5/s → 8/s（v1）→ **16/s（v11）**；smart_bot 自限 ~12.5/s（M≥8 时 ≈13.3/s）
+- `melds` 四家副露结构为 `{kind,tiles}`——`kind=="chi"` 组数即吃摊数（v25）
 
-## 6. smart_bot 多阶段主循环（v7 已落地，2026-09-04）
+## 6. smart_bot 主循环（v7 多阶段 + v13/v24/v29 自动房，2026-09-10 更新）
 
-`smart_bot.py main()` 原为单阶段：等 running → 打当前 active_games 一波 → 退出（普通锦标赛多阶段后只能靠 live_loop 反复拉起补位，且会漏决赛加赛）。现改为常驻主循环，覆盖 v7/v10/v11：
+`smart_bot.py main()` 原为单阶段：等 running → 打当前 active_games 一波 → 退出（普通锦标赛多阶段后只能靠 live_loop 反复拉起补位，且会漏决赛加赛）。现为常驻主循环，覆盖 v7/v10/v11/v13/v15/v24/v29：
 
-- **状态机**：持续轮询 `/api/me` + `/api/tournaments/{id}`，`status ∈ running|stage_open|stage_done` 均不退出，仅 `finished/closed/void` 或出席确认收到 `409 NOT_QUALIFIED`（被淘汰）时退出。
-- **running 动态扫场**：每轮扫 `active_games`，未见过的 `game_id` 起新线程 `_play_safe` 并发打；决赛平局自动加赛新 `game_id` 静默出现时同样接续（不再"打完一波就退出"）。
-- **线程生命周期**：正常结束记入 `done` 不重拉；异常退出且对局仍 active 时重试 ≤3 次（防静默丢场）。阶段间隙/候补/加赛编排期无场时静默轮询，600s 心跳日志一次防误判卡死。
+- **令牌分流**：参赛令牌（`/api/me` 的 `tournament_id` 非空）→ 报名+到位+赛程循环；全局令牌（空）→ `POST /api/match` 入席 auto 房（v13 起 auto 房唯一入口；先在 `GET /portal/api/features` 查 v29 开关，永久条件直接退出、瞬态退避重试 30 次）。`--m/--r` 声明上限须 ≥ 服务默认 M=10/Rounds=8（v15），否则本地直接拒绝。
+- **状态机**：持续轮询 `/api/me` + `/api/tournaments/{id}`，`status ∈ registering|running|stage_open|stage_done` 均不退出，仅 `finished/closed/void`（且在途场次线程已收尾）、房间 404（auto 房关停）、或出席确认 `NOT_QUALIFIED`（被淘汰）时退出。
+- **running 动态扫场**：每轮扫 `active_games`（全局令牌按 `my_games` 过滤本房），未见过的 `game_id` 起新线程 `_play_safe` 并发打；决赛平局自动加赛新 `game_id` 静默出现时同样接续。
+- **线程生命周期**：正常结束记入 `done` 不重拉；异常退出且对局仍 active 时重试 ≤3 次（防静默丢场）。阶段间隙/候补/加赛编排/auto 房等对手时静默轮询，600s 心跳日志一次防误判卡死。
 - **stage_open 出席确认**：阶段 2+ 每阶段 POST ready 一次（`confirmed_stage` 去重）；`NOT_QUALIFIED` → 淘汰退出；`TOURNAMENT_STARTED/CLOSED` 等瞬时错误不记录、下轮重试。
+- **错误码纪律（v29）**：一律按响应体 `{"code":...}` 判型（`FEATURE_DISABLED`/`PORTAL_BINDING_REQUIRED`/`AUTO_MATCH_ONLY`/`NO_ROOM_AVAILABLE`…），不按 HTTP 状态码——403/404/409 都不许杀进程。
 - **兼容性**：单阶段测试房间路径不变——finished 后照常退出（live_loop 逐波拉起/归档流程不受影响）；start 前 registering 阶段与旧"等开赛"行为等价。
+
 

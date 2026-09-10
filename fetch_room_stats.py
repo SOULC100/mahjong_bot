@@ -54,15 +54,28 @@ def main(room, outdir=None):
     winners = Counter()
     total_scores = [0, 0, 0, 0]
     per_batch = []
+    missing = []
 
     for g in games:
         b = g["batch"]
+        rnd = g.get("round")
+        want_gid = g.get("game_id")
         st = g["status"]
         if st != "finished":
             print("  batch %d: %s (未结束，跳过)" % (b, st))
             continue
         ev = get("/api/test-rooms/%s/games/%d/events" % (room, b))
-        with open(os.path.join(outdir, "events_%d.json" % b), "w", encoding="utf-8") as f:
+        got_gid = ev.get("game_id")
+        # v4/v5 跨轮复用：每轮 batch 从 0 重号；免认证端点按 batch 只服当前轮，
+        # 旧轮取不到（想留旧轮务必在该轮结束后、下一轮 open 前拉取，或用 owner 会话的
+        # GET /portal/api/games/{id}/events 按 game_id 拉）。
+        if want_gid and got_gid and want_gid != got_gid:
+            print("  batch %d: 跳过——期望 %s，端点返回 %s（跨轮重号，旧轮不可得）"
+                  % (b, want_gid, got_gid))
+            missing.append(want_gid)
+            continue
+        fn = "events_r%s_b%d.json" % (rnd if rnd is not None else "x", b)
+        with open(os.path.join(outdir, fn), "w", encoding="utf-8") as f:
             json.dump(ev, f, ensure_ascii=False)
         # 事件统计
         bD = bT = bResp = bPeng = bChi = 0
@@ -95,20 +108,24 @@ def main(room, outdir=None):
                 draws += 1
             for i, s in enumerate(sc):
                 total_scores[i] += s
-        per_batch.append((b, bD, bT, bResp, bPeng, bChi))
-        print("  batch %d: D=%d T=%d resp=%d peng=%d chi=%d" % (b, bD, bT, bResp, bPeng, bChi))
+        per_batch.append((rnd, b, bD, bT, bResp, bPeng, bChi))
+        print("  round %s batch %d: D=%d T=%d resp=%d peng=%d chi=%d"
+              % (rnd, b, bD, bT, bResp, bPeng, bChi))
         time.sleep(0.35)  # 测试房数据 API 限速 per-房间 5/s（v9 起），单房拉取留余量
 
-    # 汇总
+    # 汇总（注意：只统计能取到的轮次；跨轮重号取不到的旧轮计入 missing）
     print("\n==== 事件汇总 ====")
     print("出牌 tile_discarded 总数 D =", D)
     print("出牌超时 timeout.discard T =", T)
     print("出牌超时率 T/D = %.1f%% (%d/%d)" % (100.0 * T / D, T, D) if D else "N/A")
     print("碰/吃窗口走满 timeout.response =", resp)
     print("peng 事件 =", peng, "| chi 事件 =", chi)
+    if missing:
+        print("取不到的旧轮场次 %d 个（跨轮 batch 重号）：%s" % (len(missing), missing[:6]))
 
     print("\n==== 局结果 ====")
-    print("总对局:", len(games), "| 胡牌:", wins, "局 | 流局:", draws, "局")
+    print("房间场次总数:", len(games), "| 本次可统计:", wins + draws,
+          "| 胡牌:", wins, "局 | 流局:", draws, "局")
     print("番型分布:", dict(multipliers))
     print("胡牌座位分布:", dict(winners))
     print("各座位总积分:", total_scores)
@@ -120,6 +137,7 @@ def main(room, outdir=None):
         "games": len(games), "wins": wins, "draws": draws,
         "multipliers": dict(multipliers), "winners": dict(winners),
         "total_scores": total_scores, "per_batch": per_batch,
+        "unavailable_old_rounds": missing,
     }
     with open(os.path.join(outdir, "summary.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=1)

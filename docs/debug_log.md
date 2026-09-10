@@ -1,4 +1,4 @@
-# mahjong_bot 调试记录（2026-09-02）
+# mahjong_bot 调试记录（2026-09-02 起；§九 为 2026-09-10 版本漂移审计）
 
 > 记录本轮真实对局调试发现的所有问题、修复、以及未解决的核心矛盾。
 
@@ -47,7 +47,7 @@
 4. 线上出牌决策 vs 模拟器决策逐一对比
 5. 真实对局 bot 是否真的「没听牌」（还是听了但胡牌判定不一致）
 
-## 五、当前代码状态
+## 五、当前代码状态（2026-09-02 当时；最新状态见 §九）
 
 - `smart_bot.py`：动作判定重写 + 并发线程 + 各 bug 修复 + `depth=False` 快速出牌
 - `mahjong/fan.py`：对齐 v3 规则（七对允许财飘、最大 ×512、4白板=手留+飘出=4）
@@ -135,4 +135,53 @@
 | 胡牌/流局 | 1/9 | 2/8 | **9/1** |
 
 **结论：修复生效。** 超时率 81.4%→0.2%，bot 首次主动胡牌（9 胜），守恒误报归零、无线程崩溃。残留：1 次网络抖动超时（0.2%）+ 2 次良性 409 竞态（碰窗口已过/非己回合），已捕获无影响。
+
+## 九、指南版本漂移审计与修复（2026-09-10）
+
+### 起因
+
+手工拉 `GET /portal/api/guide/version`：**服务器 v29（updated_at 2026-09-09）**，而本仓库文档快照是
+**v11（2026-09-04）**，落后 18 个版本。指南 §2.2 本来就要求 bot 启动时做版本自检——没做，于是漂移了 5 天。
+
+抓取产物：`data/guide_version_raw.json`（版本+53 条变更）、`data/guide_version_changes.txt`（变更全文）、
+`docs/guide-v29.txt`（`GET /portal/api/guide?format=text` 权威正文，取代旧的 guide-api/guide-rules v11 快照）。
+
+### 发现的代码问题（严重度排序）
+
+| # | 位置 | 问题 | 证据 |
+|---|------|------|------|
+| C | `smart_bot.can_hu` | YCB 判据 `shanten_baotou(hand) != -1` 对 14 张胡牌**恒真**（最小值为 0）→ 持财神的胡全被拒，YCB 赛事里 bot 直接把胡牌打掉。同一 bug 2026-09-03 已在 `sim/engine` 修过，**上线 bot 没同步** | 真·爆头 14 张 `can_hu(YCB=True) → False`；`can_hu(YCB=False) → True` |
+| A | `mahjong/fan.py::seven_pairs_branch` | `laizi == 4` 无条件 +1 组四张 → 七对豪华组多算一层（v21①） | `1w×4 2w×4 5w 6w + 白×4`：本码 ×64 / fan-calc ×32 |
+| B | `sim/engine.py::_any_draw_win`、`fan.is_baotou` | 排除「正好 4 张白板」（v21② 已撤销） | `1w1w2w2w3w3w4w4w5w5w + 白×4`：本码 ×8 / fan-calc ×16 |
+| D | `smart_bot` | 未实现 v25「吃最多 2 摊」本地自限（`should_chi` 只拿到副露总摊数）→ 第 3 次 chi 吃 409，在 1s 窗口内反复提交空转 | fan-calc/指南 §2.1：吃摊数 = `melds[seat]` 中 `kind=="chi"` 组数 |
+| E | `smart_bot` | 未实现 v26 抓打圈豁免：`catch_play` 一律不碰不吃、只能打刚摸的牌 → 打财神者本人白丢吃碰/自由出牌/续飘 | 指南：受限 ⇔ `catch_play && god_discarder_seat != seat` |
+| F | `smart_bot` | `register/ready` 只吞 409，403 直接 `raise` 杀进程；v29 把 test 房重开由 409 改成 403 → 判型必须用 `code` | v24 `PORTAL_BINDING_REQUIRED`、v29 `FEATURE_DISABLED` |
+| G | 无 | 缺 `/api/match` 客户端 → v13 起 auto 房直连 register/ready 恒 409，机器人进不了自由匹配 | 指南：auto 房唯一入口 `POST /api/match` |
+| H | 无 | 无启动版本自检（本轮漂移的直接原因） | 指南 §2.2 |
+
+**核对无影响**：v7 多阶段主循环（已落地）、v13「开赛 90s 内需已认证请求」（主循环 1s 轮询天然满足）、
+v10 跨局快照、v11 16/s、v9 per-room 限速、v12 SSE / v14 guide / v18 seats / v19 `round_no,dealer`（纯加性）、
+v17/v20/v22/v23/v27/v28（门户-only）。
+
+### 修复与验证（2026-09-10）
+
+- A/B：`fan.py` 口径修正 + 新增 `any_draw_win` / `ycb_can_hu` 共享判据，`engine._any_draw_win` 改为委托。
+- C：`can_hu` 走 `ycb_can_hu`；杠开窗口用 `gang_kai_armed` 跟踪（不断言"摸到的牌变了"——杠后补牌可能与杠前同值）。
+- D/E：`GameState.chi_meld_count()`（非 `{kind,tiles}` 旧格式返回 None → 交服务端 409 兜底）、`GameState.is_catch_restricted()`（缺 `god_discarder_seat` 时退化为旧"一律受限"）；另放开圈内**暗杠**（规则只禁吃/碰/**明**杠）。
+- F：`_err_code()` 按响应体 `{"code":...}` 判型（实测 `{"code":"INVALID_ACTION","message":...}`）；403/404/401 分支各自收场，不杀进程。
+- G/H：全局令牌走 `POST /api/match`（先查 `GET /portal/api/features`，永久条件退出、瞬态退避 30 次；`--m/--r` 低于服务默认直接拒绝）；启动拉 `guide/version` 比对 `KNOWN_GUIDE_VERSION=29`。
+
+**验证**：`data/_probe_fancalc.py` 对拍 fan-calc **5/5 一致**（修复前 2 例 DIFF）；
+`tests/test_fan.py` 新增 v21 用例（期望值取权威端点）、`tests/test_smart_bot.py` 新增协议层回归
+（YCB 真爆头必须提交 hu、非爆头不得提交、吃摊门禁、抓打圈豁免、`play()` 假 api 全链路）；
+全部测试 PASS，`test_sim.py` 300 局不变量 PASS。
+
+### 仍未做
+
+- **sim 未建模抓打圈**：`sim/engine.py` 无 `catch_play`/`god_discarder_seat`，财飘收益被高估（B1 结论需重验）。
+- 线上仍只做暗杠（明杠/补杠待做）。
+- `decision._fan_ting_expect` 调 `calc_fan` 不传 `baotou`（仅 `fan_est=real*` 用到，B4 已证伪）。
+- 番型口径改动后基线未重跑（旧 A/B 数值引用需谨慎）。
+- 遗留脚本：`bot.py`/`debug_bot.py` 是 allowed_actions 时代产物（v2+ 必失效）；`wait_room.py` 等的 `"全部完成"` 只有 `bot.py` 打印；`fetch_room_stats.py` 按 `batch` 命名存档，v4 跨轮复用后每轮 batch 从 0 重号会互相覆盖。
+
 

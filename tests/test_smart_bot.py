@@ -20,8 +20,8 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-# smart_bot 以脚本方式读 sys.argv，导入前先补齐
-sys.argv = ["smart_bot.py", "test"]
+# smart_bot 以脚本方式读 sys.argv，导入前先补齐（argv[2] = 编号 → 日志落 data/smart_test.log）
+sys.argv = ["smart_bot.py", "test", "test"]
 
 from mahjong.tiles import list_to_count
 import smart_bot
@@ -119,6 +119,78 @@ def main():
            bool(act_e) and act_e.get("action") == "discard" and act_e.get("tile") != "白", True)
     finally:
         smart_bot.should_chi, smart_bot.should_peng = orig_chi, orig_peng
+
+    # ---------- play() 全链路冒烟：假 api 喂快照，验证 v25/v26 新字段解析不炸 ----------
+    def run_play(snaps, posts, ycb=False):
+        """按顺序喂快照（最后一个之后返回 finished），收集 POST 动作。"""
+        it = iter(snaps)
+
+        def fake_api(method, path, body=None, auth=True):
+            if method == "GET":
+                try:
+                    return {"seq": 1, "snapshot": next(it)}
+                except StopIteration:
+                    return {"finished": True, "snapshot": {"scores": [0, 0, 0, 0]}}
+            posts.append(body)
+            return {}
+
+        orig = smart_bot.api
+        smart_bot.api = fake_api
+        try:
+            smart_bot.play("g1", smart_bot.GameState(), ycb)
+        finally:
+            smart_bot.api = orig
+
+    def snap(hand_strs, phase="draw", turn=0, drawn="", melds=None, god=None, discard="",
+             responding=None):
+        """hand_strs = 协议字符串列表（快照 my_hand 原样；draw 阶段含刚摸的牌）。"""
+        return {"seat": 0, "phase": phase, "turn": turn, "drawn_tile": drawn,
+                "last_discard": discard, "my_hand": list(hand_strs),
+                "responding_seats": responding if responding is not None else [],
+                "melds": melds or [[], [], [], []],
+                "god": god or {}, "discards": [[], [], [], []], "wall_remaining": 60,
+                "hand_counts": [14, 13, 13, 13], "scores": [0, 0, 0, 0]}
+
+    posts = []
+    run_play([snap(["1w", "1w", "1w", "2w", "2w", "2w", "3w", "3w", "3w",
+                    "4w", "5w", "6w", "7w", "9w"], drawn="9w")], posts)
+    ck("play() 出牌回合提交 discard", len(posts) == 1 and posts[0].get("action") == "discard", True)
+
+    # YCB 真·爆头：必须是 hu（旧判据下这里会变成 discard —— 把胡牌打掉）
+    posts_hu = []
+    run_play([snap(["1w", "1w", "1w", "2w", "2w", "2w", "3w", "3w", "3w",
+                    "4w", "4w", "4w", "白", "东"], drawn="东")], posts_hu, ycb=True)
+    ck("play() YCB 真爆头提交 hu", len(posts_hu) == 1 and posts_hu[0].get("action") == "hu", True)
+
+    # YCB 非爆头（财神在面子内的平胡）→ 不得提交 hu
+    posts_no = []
+    run_play([snap(["1w", "2w", "4w", "5w", "6w", "7w", "8w", "9w",
+                    "1t", "1t", "1t", "5t", "5t", "白"], drawn="5t")], posts_no, ycb=True)
+    ck("play() YCB 非爆头不提交 hu",
+       bool(posts_no) and posts_no[0].get("action") == "discard", True)
+
+    # 圈内受限方在碰窗口 → 不提交（窗口自然走满）：10 张手牌 + 1 组吃副露 = 13 张
+    # 两个子用例都用 should_peng=True 打桩，只验证「圈」的门禁（不掺决策引擎判断）
+    chi_row = [{"kind": "chi", "tiles": ["1w", "2w", "3w"]}]
+    hand10 = ["1w", "1w", "2w", "2w", "2w", "4w", "5w", "6w", "7w", "8w"]
+    orig_peng2 = smart_bot.should_peng
+    smart_bot.should_peng = lambda *a, **k: True
+    try:
+        posts_r = []
+        run_play([snap(hand10, phase="response_peng", turn=1, discard="2w",
+                       responding=[0], melds=[chi_row, [], [], []],
+                       god={"catch_play": True, "god_discarder_seat": 1})], posts_r)
+        ck("play() 圈内受限方不碰（无 POST）", posts_r, [])
+
+        # 同一窗口但本人是打财神者（豁免）→ 应提交
+        posts_e = []
+        run_play([snap(hand10, phase="response_peng", turn=1, discard="2w",
+                       responding=[0], melds=[chi_row, [], [], []],
+                       god={"catch_play": True, "god_discarder_seat": 0})], posts_e)
+        ck("play() 圈内豁免方可碰（有 POST）",
+           len(posts_e) == 1 and posts_e[0].get("action") == "peng", True)
+    finally:
+        smart_bot.should_peng = orig_peng2
 
     print("\n" + ("ALL PASS" if ok else "SOME FAILED"))
     return 0 if ok else 1

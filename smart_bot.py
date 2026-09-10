@@ -33,8 +33,9 @@ from mahjong.fan import ycb_can_hu
 
 SERVER = "https://10.240.169.190:18080"
 
-# 本代码已核对的接入指南版本（GET /portal/api/guide/version，2026-09-09 = v29）
-KNOWN_GUIDE_VERSION = 29
+# 本代码已核对的接入指南版本（GET /portal/api/guide/version，2026-09-10 = v30）
+# v30 = 他人姓名字段收口（一律昵称/空串）——bot 不用 name 字段，零影响；v29 = 全服功能开关（403 FEATURE_DISABLED）。
+KNOWN_GUIDE_VERSION = 30
 
 
 def _parse_args(argv):
@@ -322,8 +323,10 @@ def play(gid, state, youcai_bikao=False):
     responded_key = None  # 当前响应窗口 key，已响应则不再重复提交
     skip_hu = False  # hu 误判被拒后，本次手牌状态跳过 hu
     last_drawn = None
-    gang_pending = False  # 刚提交过杠 → 下一张摸牌是杠后补牌
-    gang_kai_for = None  # 杠后补牌的那张（字符串）：仅该摸牌回合算杠开（YCB 免爆头）
+    # 杠开窗口（YCB 免爆头胡法）：杠提交成功即armed，本次摸牌回合内有效；
+    # 一旦提交别的动作（出牌/碰/吃）即解除。不用「drawn 变化」判——杠后补牌可能与杠前
+    # 那张同值（例如手里 4×5w、摸 3t 杠 5w 后又摸到 3t），按牌面比较会漏判。
+    gang_kai_armed = False
     drift_streak = 0  # 连续守恒校验失败计数，防死循环
     while True:
         try:
@@ -382,14 +385,12 @@ def play(gid, state, youcai_bikao=False):
             log("连续漂移，放弃校验继续")
         else:
             drift_streak = 0
-        # 新摸牌（drawn_tile 变化）则重置 hu 拦截；杠后补牌只对紧接着的这一张生效
+        # 新摸牌（drawn_tile 变化）则重置 hu 拦截
         drawn = snap.get("drawn_tile", "")
         if drawn != last_drawn:
             last_drawn = drawn
             skip_hu = False
-            gang_kai_for = drawn if (gang_pending and drawn) else None
-            gang_pending = False
-        gang_kai = bool(drawn) and drawn == gang_kai_for
+        gang_kai = gang_kai_armed  # 杠开窗口见上方说明
         phase_info = determine_action(snap)
         if phase_info is None:
             continue
@@ -408,7 +409,9 @@ def play(gid, state, youcai_bikao=False):
         try:
             api("POST", "/api/games/%s/action" % gid, act)
             if act.get("action") == "gang":
-                gang_pending = True  # 等杠后补牌（下一张 drawn）判杠开
+                gang_kai_armed = True  # 本次摸牌回合（杠后补牌）适用 YCB 杠开豁免
+            else:
+                gang_kai_armed = False  # 别的动作收尾 = 杠开窗口关闭
             if phase in ("peng", "chi"):
                 responded_key = (phase, snap.get("turn"), tile_str,
                                  tuple(snap.get("responding_seats") or []))
@@ -423,7 +426,7 @@ def play(gid, state, youcai_bikao=False):
             if act["action"] == "hu":
                 skip_hu = True  # 误判能胡被拒，本次手牌回退出牌
             if act["action"] == "gang":
-                gang_pending = False  # 杠被拒 → 别把下一张摸牌误当杠后补牌（杠开）
+                gang_kai_armed = False  # 杠被拒 → 没有杠后补牌
             log("409 拒绝:", code, json.dumps(act, ensure_ascii=False), e.body[:150])
         seq = 0
 

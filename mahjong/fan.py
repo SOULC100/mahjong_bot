@@ -134,7 +134,7 @@ def calc_fan(hand_counts, gang_kai=False, piao_count=0, baotou=False) -> int:
     baotou: 是否真·爆头（摸牌前已是「4面子+财神单吊」或「6对+财神」=任意摸都胡，
             2026-09-03 修：不能仅凭终局 14 张结构判——"最后摸来的财神补成七对/面子"不算爆头，
             服务器口径 fan=4（青龙 1w1w7w7w8w8w3t3t3t9b9b9b9b+白 实证）。引擎在胡牌瞬间知道
-            摸前 13 张形，由调用方（sim/engine）用 `_any_draw_win(摸前13)` 计算后传入。）
+            摸前 13 张形，由调用方用 `any_draw_win(摸前13)` 计算后传入。）
     """
     tiles, laizi = split_laizi(hand_counts)
 
