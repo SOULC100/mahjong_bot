@@ -86,11 +86,24 @@ class Replay:
                 h[tile_from_str(s)] += 1
             self.hands.append(h)
         self.last_drawn = [None] * 4
+        self.last_replenish = [False] * 4   # 当前手上那张牌是否「杠后补牌」（v33 判定杠开用）
         self.chain = [0] * 4
         self.chi_seat = [0] * 4
         self.melds = [[] for _ in range(4)]
         self.kongs = [0] * 4
         self.circle = None
+
+    def _is_baotou(self, seat):
+        """赢家的**暗手**摸前是否「任意摸都胡」（真·爆头）；带副露数。"""
+        pre = list(self.hands[seat])
+        d = self.last_drawn[seat]
+        if not d:
+            return False
+        idx = tile_from_str(d)
+        pre[idx] -= 1
+        if pre[idx] < 0:
+            return False
+        return bool(any_draw_win(pre, len(self.melds[seat])))
 
     def bad(self, kind, info):
         self.viol[kind] += 1
@@ -107,6 +120,7 @@ class Replay:
         if t == "tile_drawn" and 0 <= seat < 4 and tile:
             self.hands[seat][tile_from_str(tile)] += 1
             self.last_drawn[seat] = tile
+            self.last_replenish[seat] = bool(data.get("gang_replenish"))  # v33：杠后补牌
             if self.circle == seat:
                 self.circle = None          # 一圈回到打财神者本人 → 圈结束
         elif t == "tile_discarded" and 0 <= seat < 4 and tile:
@@ -137,6 +151,7 @@ class Replay:
                     self.hands[seat][tile_from_str(s)] -= 1
             self.melds[seat].append(list(data.get("tiles") or []))
             self.last_drawn[seat] = None
+            self.last_replenish[seat] = False
             self.chain[seat] = 0
         elif t == "peng" and 0 <= seat < 4:
             if self.circle is not None and seat != self.circle:
@@ -145,32 +160,66 @@ class Replay:
                 self.hands[seat][tile_from_str(tile)] -= 2
                 self.melds[seat].append([tile] * 3)
             self.last_drawn[seat] = None
+            self.last_replenish[seat] = False
             self.chain[seat] = 0
         elif t in ("gang", "angang", "minggang", "bugang") and 0 <= seat < 4:
             if self.circle is not None and seat != self.circle and t == "minggang":
                 self.bad("v26_act", (round_no, t, seat, self.circle))
             if tile:
-                self.hands[seat][tile_from_str(tile)] -= (4 if t == "angang" else 3)
-                self.melds[seat].append([tile] * 4)
+                # 2026-09-21 修正：线上把三种杠都发成 `type="gang"`，靠 `data.kind` 区分：
+                #   an=暗杠（手里 4 张→副露 4 张） / ming=明杠（手里 3 张 + 别人弃牌） / bu=补杠（碰过 + 手里第 4 张）
+                # 旧实现一律按「手里 -3」处理 → 暗杠少扣 1、补杠多扣 2 → 手牌负计数、
+                # 进而把杠局的全手牌重建错，导致 calc_fan 对拍假 DIFF（2026-09-21 真机 100 局里 4 例）。
+                kind = str(data.get("kind") or "").lower()
+                idx = tile_from_str(tile)
+                if t == "angang" or kind in ("an", "angang"):
+                    self.hands[seat][idx] -= 4
+                    self.melds[seat].append([tile] * 4)
+                elif t == "bugang" or kind in ("bu", "bugang"):
+                    self.hands[seat][idx] -= 1          # 碰的 3 张已在副露里
+                    for i, m in enumerate(self.melds[seat]):
+                        if len(m) == 3 and m and m[0] == tile:
+                            self.melds[seat][i] = [tile] * 4
+                            break
+                    else:
+                        self.melds[seat].append([tile] * 4)
+                else:                                    # ming（默认）：手里 3 张 + 弃牌
+                    self.hands[seat][idx] -= 3
+                    self.melds[seat].append([tile] * 4)
                 self.kongs[seat] += 1
             self.chain[seat] += 1
             self.last_drawn[seat] = None
+            self.last_replenish[seat] = False
         elif t == "round_ended" and not data.get("draw") and 0 <= seat < 4:
             full = list(self.hands[seat])
             for m in self.melds[seat]:
                 for s in m:
                     full[tile_from_str(s)] += 1
+            # 杠（4 张一副露）在「4 面子+将」结构里只算 3 张：去掉那 1 张，全手才回到 14 张等效。
+            # v32（2026-09-12）修的正是「杠爆」判定，这里必须能验杠局，否则杠局会被整体跳过。
+            n_kong = 0
+            for m in self.melds[seat]:
+                if len(m) == 4:
+                    full[tile_from_str(m[0])] -= 1
+                    n_kong += 1
             self.hus.append({
                 "round_no": data.get("round_no", round_no),
                 "winner": seat,
                 "hand": full,
                 "n_melds": len(self.melds[seat]),
-                "kongs": self.kongs[seat],
+                "melds": [list(m) for m in self.melds[seat]],
+                "kongs": n_kong,
                 "drawn": self.last_drawn[seat],
                 "chain": self.chain[seat],
                 "server_fan": data.get("fan"),
                 "server_detail": data.get("detail"),
                 "dealer": data.get("dealer"),
+                # 2026-09-21 修正：这两个标记必须**按事件**判定，不能靠"有没有杠"猜：
+                #  · gang_kai：只有「这张牌是杠后补牌」才算杠开（v33 的 tile_drawn.data.gang_replenish）
+                #  · baotou  ：用**暗手**（不含副露）的摸前 13-3n 张判「任意摸都胡」，且要带上副露数
+                #    旧实现用重建后的 14 张等效手牌 + 硬编码 melds=0 → 杠局的番型对拍全是假 DIFF。
+                "gang_kai": bool(self.last_replenish[seat]),
+                "baotou": self._is_baotou(seat),
             })
         for i in range(4):
             if self.hands[i] and any(c < 0 for c in self.hands[i]):
@@ -230,8 +279,19 @@ def main():
                     continue
                 h13 = list(hand)
                 h13[tile_from_str(h["drawn"])] -= 1
-                baotou = any_draw_win(h13, 0)
-                local = calc_fan(hand, piao_count=h["chain"], baotou=baotou)
+                # baotou / gang_kai 由 Replay 按事件判定（2026-09-21 修正，见 Replay.feed 的注释）
+                baotou = h.get("baotou")
+                if baotou is None:                      # 老归档兜底
+                    baotou = any_draw_win(h13, h.get("n_melds", 0))
+                gang_kai = h.get("gang_kai")
+                if gang_kai is None:
+                    gang_kai = max(0, h["kongs"]) > 0
+                # 动作链拆分（2026-09-20）：服务端 chain = 飘 + 杠 的累计次数，两者都是 ×2。
+                # 旧代码把整条 chain 当成 piao_count 传（当时真机 chain 恒为 0 所以看不出来），
+                # 一旦出现财飘或扛链就会算错——这里按 kongs 拆出杠、其余算飘。
+                piao_n = max(0, h["chain"] - h["kongs"])
+                gang_n = max(0, h["kongs"])
+                local = calc_fan(hand, gang_kai=gang_kai, piao_count=piao_n, baotou=baotou)
                 srv = h["server_fan"]
                 ok = (local == srv)
                 fan_ok += ok
@@ -239,14 +299,14 @@ def main():
                 for det in (h["server_detail"] or []):
                     details[det] += 1
                 h13s = [tile_to_str(i) for i in range(NUM_TILES) for _ in range(h13[i])]
-                api = fan_calc(h13s, h["drawn"], h["chain"], h["chain"])
+                api = fan_calc(h13s, h["drawn"], h["chain"], piao_n)
                 a_fan = api.get("fan")
                 api_ok += (a_fan == srv)
                 api_bad += (a_fan != srv)
-                line = ("   round=%s winner=%s dealer=%s 手牌=%s 摸=%s chain=%d baotou=%s | "
+                line = ("   round=%s winner=%s dealer=%s 手牌=%s 摸=%s chain=%d(飘%d/杠%d) baotou=%s | "
                         "服务器 x%s %s | calc_fan x%s %s | fan-calc x%s %s"
                         % (h["round_no"], h["winner"], h["dealer"], "".join(h13s), h["drawn"],
-                           h["chain"], baotou, srv, h["server_detail"], local,
+                           h["chain"], piao_n, gang_n, baotou, srv, h["server_detail"], local,
                            "OK" if ok else "**DIFF**", a_fan, "OK" if a_fan == srv else "**DIFF**"))
                 op(line)
                 if not ok or a_fan != srv:

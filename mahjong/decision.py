@@ -10,11 +10,12 @@
 
 import math
 
-from .tiles import LAIZI_INDEX, NUM_TILES, is_number
+from .tiles import LAIZI_INDEX, NUM_TILES, is_number, pair_completions
 from .win import split_laizi
-from .fan import _is_four_melds, calc_fan
+from .fan import _is_four_melds, any_draw_win, calc_fan
 from .shanten import shanten, shanten_baotou
-from .ukeire import shanten_after_discard, ukeire_quality, ukeire_depth, unique_tiles, ting_count
+from .ukeire import shanten_after_discard, ukeire_quality, ukeire_depth, ukeire_wait_width, \
+    unique_tiles, ting_count
 
 # ---- EV 权重（可调） ----
 # 出牌打分 = 向听数 × SHANTEN_COST - 进张质量 × UKEIRE_W - 番型 × FAN_W × 庄家倍数
@@ -72,7 +73,68 @@ def should_piao(hand) -> bool:
     return _is_four_melds(tiles)
 
 
-def should_peng(hand13, peng_tile, melds=0, ukeire_gate=False, remain=None, gate_max_shanten=None) -> bool:
+# ---- 弃胡 + 财飘（2026-09-20） ----
+# 规则依据（guide v34 §1.2 / §1.3 财飘表）：
+#   「弃胡」= 摸牌后不强制自动胡，可继续打牌（飘/杠链的前提）；
+#   「爆头摸到白板」：可提交 hu（爆头 ×2），也可弃胡打白飘（博财飘 ×4 起，可连飘 ×8/×16）；
+#   v33 起杠后补牌同口径。打出非飘非杠的牌（含非爆头态打白板）→ 链断。
+# 结论：飘的**合法前提 = 打完那张财神后仍处「任意摸都胡」态**（否则链断，白丢一个胡）。
+PIAO_Q_EST = 0.75         # 「活过一圈（自己下次摸牌前没人胡）」的存活率估计（rules-strategy §2.5 实测 0.75~0.80）
+PIAO_MAX_CHAIN = 3        # 连飘上限：每多飘一次都要再活一圈，q^n 衰减
+PIAO_LOSS_DEALER = 8.0    # 被抢先时我方损失（庄家：谁胡都按 ×8 付）
+PIAO_LOSS_IDLE = 2.75     # 闲家：1/4 概率庄家胡（付 8）+ 3/4 闲家胡（付 1）≈ 2.75
+
+
+def piao_after_discard(hand, melds=0) -> bool:
+    """打出一张财神后是否仍「任意摸都胡」= 财飘的合法前提（guide §1.2）。
+
+    hand: 14-3*melds 张（含 ≥2 张财神）。判据与 mahjong.fan.any_draw_win 同源，
+    覆盖两种形态：①平胡形 4 面子 + 2 财神；②七对形（七客：6 对 + 2 财神，或豪华组）。
+    """
+    if hand[LAIZI_INDEX] < 2:
+        return False
+    c = list(hand)
+    c[LAIZI_INDEX] -= 1
+    return any_draw_win(c, melds)
+
+
+def should_decline_hu(hand, melds=0, drawn=-1, gang_kai=False, chain_count=0,
+                      is_dealer=False, q_est=PIAO_Q_EST, max_chain=PIAO_MAX_CHAIN) -> bool:
+    """能胡时**是否弃胡去打财飘**（规则明确允许的战术，guide §1.2）。
+
+    调用方须已确认这手牌能胡（can_hu）。EV 模型（rules-strategy §2.5，底分 1）：
+
+        EV(弃胡飘) − EV(直接胡) = f0·(2q − 1) − (1 − q)·c
+        ⇒ 盈亏平衡存活率 q* = (f0 + c) / (2·f0 + c)
+
+    f0 = 现在胡的番（爆头 ×2 / 4 白 ×2 / 已有链 ×2^chain 都算进去）
+    c  = 被对手抢先时我方损失（庄家 8、闲家 ≈2.75，按对手番型 1 估）
+    q  = 活过一圈的概率（默认保守取 PIAO_Q_EST=0.75）
+
+    只在**同时**满足「打白后仍爆头」+「q_est > q*」+「连飘未超上限」时才弃胡。
+    典型结果：闲家 f0=2 → q*=0.70 < 0.75 → 飘；庄家 f0=2 → q*=0.83 > 0.75 → 不飘。
+
+    hand: 14-3*melds 张胡牌形；drawn: 刚摸的牌（判「现在这胡算不算爆头」用，-1=未知）。
+    """
+    if chain_count >= max_chain:
+        return False
+    if shanten(hand, melds) != -1:
+        return False                      # 不是胡牌形 → 谈不上弃胡
+    if not piao_after_discard(hand, melds):
+        return False                      # 打白后链会断 → 纯亏，不弃
+    baotou_win = False
+    if 0 <= drawn < NUM_TILES and hand[drawn] > 0:
+        h13 = list(hand)
+        h13[drawn] -= 1
+        baotou_win = any_draw_win(h13, melds)
+    fan_now = calc_fan(hand, gang_kai=gang_kai, piao_count=chain_count, baotou=baotou_win)
+    loss = PIAO_LOSS_DEALER if is_dealer else PIAO_LOSS_IDLE
+    q_star = (fan_now + loss) / (2.0 * fan_now + loss)
+    return q_est > q_star
+
+
+def should_peng(hand13, peng_tile, melds=0, ukeire_gate=False, remain=None, gate_max_shanten=None,
+                gate_min_gain=0.0) -> bool:
     """是否碰：碰后（副露 + 打 1 张）向听数下降才碰。
 
     hand13: 13 张暗手（34 维计数，不含刚摸的）
@@ -82,6 +144,8 @@ def should_peng(hand13, peng_tile, melds=0, ukeire_gate=False, remain=None, gate
     remain: 牌墙剩余估算（34 维），None 时按每种 4 张估算。
     gate_max_shanten: 门控最大前置向听数。仅当 pre 向听 <= 该值才允许「等向听但质量提升」的碰
                       （限制过早锁面子；None=不限）。
+    gate_min_gain: 门控的最小质量增益比例（0=只要有提升就碰）。1.05 = 要求提升 ≥5%，
+                   用来过滤「提升一点点就锁面子」的边缘情形。
     """
     s_no = shanten(hand13, melds)
     if hand13[peng_tile] < 2:
@@ -104,7 +168,8 @@ def should_peng(hand13, peng_tile, melds=0, ukeire_gate=False, remain=None, gate
             if shanten(c2, melds + 1) != best:
                 continue
             best_q = max(best_q, _draw_quality(c2, remain, melds + 1))
-        return best_q > _draw_quality(hand13, remain, melds)
+        cur_q = _draw_quality(hand13, remain, melds)
+        return best_q > cur_q * (1.0 + gate_min_gain) if cur_q > 0 else best_q > cur_q
     return False
 
 
@@ -125,20 +190,49 @@ def chi_combos(hand13, chi_tile):
     return combos
 
 
-def best_chi(hand13, chi_tile, melds=0, ukeire_gate=False, remain=None):
+def best_chi(hand13, chi_tile, melds=0, ukeire_gate=False, remain=None, gate_min_gain=0.0,
+             gate_max_shanten=None, narrow_max_accept=None, narrow_min_shanten=None,
+             prefer_narrow=False, accept_remain=None):
     """返回吃 chi_tile 的最优搭子（两张某他手牌索引），不可吃返回 None。
 
     hand13: 13 张暗手；chi_tile: 上家打出的牌；melds: 已副露面数。
     默认条件：吃后（副露 + 打 1 张）向听数下降。
     ukeire_gate: A1 门控。True 时向听数不变、但进张质量提升也吃。
+    gate_min_gain: 门控的最小质量增益比例（0=有提升就吃；1.05=要求 ≥5%）。
+    gate_max_shanten: 等向听门控的最大前置向听数（None=不限；与 should_peng 同义）。
+
+    **吃额度/搭子宽度（2026-09-25，R15）**：
+    narrow_max_accept / narrow_min_shanten：向听 ≥ narrow_min_shanten 时，
+        只吃「搭子剩余进张 ≤ narrow_max_accept」的搭子（0 = 不吃这副搭子就废了）。
+        理由：还剩好几手才能听牌时，搭子自己能摸进来的宽搭子不急着用吃（吃额度只有 2 摊），
+        把额度留给**摸不进来**的窄搭子；见 docs/eval-rounds.md §22。
+    prefer_narrow：同一张弃牌有多个吃法时，优先消耗**剩余进张最少**的那副搭子
+        （先消化死搭子，把宽搭子留在手里继续摸）。
+    accept_remain：只给「搭子剩余进张」判据用的口径（默认 = remain）。**必须传原始未见张数**
+        （`GameState.raw_unseen` / sim `remain_estimate`）：narrow_max_accept 是绝对张数阈值，
+        若用线上那个按牌墙缩放过的 remain（≈0.47×），同一个阈值在线上/离线含义不同。
     """
     combos = chi_combos(hand13, chi_tile)
     if not combos:
         return None
     s_no = shanten(hand13, melds)
+    acc_src = remain if accept_remain is None else accept_remain
+
+    def _accept(pair):
+        """这副搭子去掉被吃的这张后，还能靠自摸补上的张数（口径未知时返回 None）。"""
+        if acc_src is None:
+            return None
+        return sum(acc_src[t] for t in pair_completions(pair[0], pair[1]) if t != chi_tile)
+
     best_eq = None
     best_eq_q = -1.0
+    best_eq_acc = None
+    strict = []            # 严格降向听的吃法：(剩余进张, 吃后质量, 吃后向听, 搭子)
     for others in combos:
+        acc = _accept(others)
+        if (narrow_max_accept is not None and acc is not None
+                and s_no >= (narrow_min_shanten or 0) and acc > narrow_max_accept):
+            continue                      # 宽搭子：把额度留给窄的（见 §22）
         c = list(hand13)
         c[others[0]] -= 1
         c[others[1]] -= 1
@@ -157,24 +251,43 @@ def best_chi(hand13, chi_tile, melds=0, ukeire_gate=False, remain=None):
                 if q > best_s_q:
                     best_s_q = q
         if best_s < s_no:
-            return others  # 严格降向听：直接吃（与旧行为一致）
-        if ukeire_gate and best_s == s_no:
-            if best_s_q > best_eq_q:
-                best_eq_q = best_s_q
-                best_eq = others
+            if not prefer_narrow:
+                return others  # 严格降向听：直接吃（与旧行为一致）
+            strict.append((best_s, acc if acc is not None else 0, best_s_q, others))
+            continue
+        if ukeire_gate and best_s == s_no and (gate_max_shanten is None or s_no <= gate_max_shanten):
+            if best_eq is None:
+                best_eq, best_eq_q, best_eq_acc = others, best_s_q, acc
+            elif prefer_narrow and acc is not None and best_eq_acc is not None:
+                if (acc, -best_s_q) < (best_eq_acc, -best_eq_q):
+                    best_eq, best_eq_q, best_eq_acc = others, best_s_q, acc
+            elif best_s_q > best_eq_q:
+                best_eq, best_eq_q, best_eq_acc = others, best_s_q, acc
+    if prefer_narrow and strict:
+        # 先保「吃后向听最好」，再消化进张最少的搭子，最后看吃后进张质量
+        strict.sort(key=lambda x: (x[0], x[1], -x[2]))
+        return strict[0][3]
     if ukeire_gate and best_eq is not None:
-        # 向听数不变，但吃后进张质量提升也吃
-        if best_eq_q > _draw_quality(hand13, remain, melds):
+        # 向听数不变，但吃后进张质量提升也吃（gate_min_gain 可要求最小增益比例）
+        cur_q = _draw_quality(hand13, remain, melds)
+        if best_eq_q > (cur_q * (1.0 + gate_min_gain) if cur_q > 0 else cur_q):
             return best_eq
     return None
 
 
-def should_chi(hand13, chi_tile, melds=0, ukeire_gate=False, remain=None) -> bool:
+def should_chi(hand13, chi_tile, melds=0, ukeire_gate=False, remain=None, gate_min_gain=0.0,
+               gate_max_shanten=None, narrow_max_accept=None, narrow_min_shanten=None,
+               prefer_narrow=False, accept_remain=None) -> bool:
     """是否吃：吃后（副露 + 打 1 张）向听数下降才吃。
 
     ukeire_gate: A1 门控。True 时向听数不变、但进张质量提升也吃。
+    gate_min_gain: 门控的最小质量增益比例（0=有提升就吃；1.05=要求 ≥5%）。
+    gate_max_shanten: 等向听门控的最大前置向听数（None=不限）。
+    narrow_max_accept / narrow_min_shanten / prefer_narrow / accept_remain：见 best_chi。
     """
-    return best_chi(hand13, chi_tile, melds, ukeire_gate, remain) is not None
+    return best_chi(hand13, chi_tile, melds, ukeire_gate, remain, gate_min_gain,
+                    gate_max_shanten, narrow_max_accept, narrow_min_shanten,
+                    prefer_narrow, accept_remain) is not None
 
 
 # ---- 暗杠时机（听牌才杠 + 七对/豪华七对保护）----
@@ -238,18 +351,20 @@ def knock_shanten(counts, melds=0):
     return best
 
 
-def _fan_value(counts) -> int:
+def _fan_value(counts, melds=0, melds_aware=False) -> int:
     """手牌的番型价值（越高越有做大番的潜力）。
 
     - 财神：爆头/财飘潜力（每个 +3）
-    - 对子 >= 4：七对路线（每个对子 +1）
+    - 对子 >= 4：七对路线（每个对子 +1）——**melds_aware=True 且已有副露时不给**
+      （2026-09-20：`shanten(..., melds>0)` 已把七对分支置 99，有副露还给这个加分就是"幻影七对"，
+       等于每次吃碰后白拿几分；作为候选方案 `fan_value_melds` 由调用方显式打开）
     - 刻子：杠潜力（每个 +1）
     """
     tiles, laizi = split_laizi(counts)
     pairs = sum(1 for c in tiles if c >= 2)
     triples = sum(1 for c in tiles if c >= 3)
     val = laizi * 3
-    if pairs >= 4:
+    if pairs >= 4 and not (melds_aware and melds > 0):
         val += pairs
     val += triples
     return val
@@ -371,6 +486,7 @@ def discard_decision(hand, remain=None, melds=0, depth=True, dealer=False, fan_o
                      defend_hot_max=D1_HOT_MAX, defend_window=D1_WINDOW, defend_mode="suit",
                      fan_est="heuristic", protect_gang=True, gang_keep_pen=GANG_KEEP_PEN, knock=False,
                      ycb_escape_gap=0, dealer_speed=False,
+                     fan_value_melds=False, wait_width=None, wait_tie_eps=0.0,
                      shanten_cost=SHANTEN_COST, ukeire_w=UKEIRE_W, fan_weight=FAN_W,
                      god_fan_boost=1.0):
     """出牌决策：返回最优出牌 tile 索引。
@@ -408,6 +524,11 @@ def discard_decision(hand, remain=None, melds=0, depth=True, dealer=False, fan_o
     dealer_speed: 坐庄抢速（dealer_policy='aggr'，2026-09-03 实测当庄 +0.8~+1.9 avg）。
         坐庄方宝押胡牌率而非番型/动作：把爆头路线 slack/max 收紧到 0（不为爆头牺牲向听）、
         杠子保留分清零（protect_gang 失效，别为未来杠压牌速）。闲家不触发 = 逐决策与基线一致。
+    fan_value_melds: 番型启发式是否认副露——True 时有副露不再给「对子>=4 的七对加分」
+        （默认 False=旧行为；修的是"幻影七对"：有副露时七对分支已不可达）。
+    wait_width: P1-a 听口宽度（None=旧行为 / "tiebreak"=只在总分并列时按"进张×落地听口"破平
+        / "full"=直接把 ukeire 项换成 wait-width 口径）。
+        动机实测：向听=1 的出牌点里 4.5% 现引擎选的不是两步最优（data/_wait_opportunity.txt）。
     shanten_cost / ukeire_w / fan_weight: 打分权重（2026-09-03 穿参，默认=模块常量现值）。
         score = shanten×shanten_cost - ukeire×ukeire_w - fan×fan_w(fan_override)×dealer_mult；
         shanten_cost=100 时 1 向听 ≈ 单位；fan_weight 控制「番型抵消向听」力度。
@@ -419,7 +540,10 @@ def discard_decision(hand, remain=None, melds=0, depth=True, dealer=False, fan_o
         gang_keep_pen = 0.0
 
     # 财飘优先（财神须在可打集合内）
-    if piao_enabled and should_piao(hand) and (not piao_dealer_only or dealer) and (allowed is None or LAIZI_INDEX in allowed):
+    # 2026-09-20：判据由 should_piao（4 面子 + 2 财神）放宽到 piao_after_discard（打白后仍爆头）——
+    # 后者是规则口径的超集，额外覆盖**七对形**财飘（guide v3「七对可财飘」：6 对 + 2 财神 / 豪华组）。
+    # 弃胡路径依赖它把财神真的打出去（否则弃了胡又打别的牌 = 链断 + 白丢一个胡）。
+    if piao_enabled and piao_after_discard(hand, melds) and (not piao_dealer_only or dealer) and (allowed is None or LAIZI_INDEX in allowed):
         return LAIZI_INDEX
 
     tiles, laizi = split_laizi(hand)
@@ -483,17 +607,18 @@ def discard_decision(hand, remain=None, melds=0, depth=True, dealer=False, fan_o
     def _fan_for(c):
         """按 fan_est 取 13 张番型估计（c = 打 d 后的手牌）。"""
         if fan_est == "heuristic":
-            return _fan_value(c)
+            return _fan_value(c, melds, melds_aware=fan_value_melds)
         if fan_est == "real":
             return _fan_value_real(c, melds, remain)
         if fan_est == "real_k1":
             return _fan_value_real(c, melds, remain, k=1.0)  # 降权：fan 只作次级 tiebreak
         # real_ting：仅已听牌用 calc_fan 试算真实倍率，其余仍用启发式
         e = _fan_ting_expect(c, melds, remain)
-        return FAN_REAL_K * e if e is not None else _fan_value(c)
+        return FAN_REAL_K * e if e is not None else _fan_value(c, melds, melds_aware=fan_value_melds)
 
     best_d = -1
     best_score = None
+    tied = []          # wait_width="tiebreak"：并列最优的候选，稍后用「进张×落地听口」破平
     for d in pool:
         if s_map[d] > bound:
             continue
@@ -502,6 +627,8 @@ def discard_decision(hand, remain=None, melds=0, depth=True, dealer=False, fan_o
         fan = _fan_for(c)
         if s_map[d] == 0:
             ukeire_val = ting_count(c, remain, melds)  # 听牌宽度：能胡的牌加权数
+        elif wait_width == "full":
+            ukeire_val = ukeire_wait_width(hand, d, remain, melds)
         elif baotou_route or not depth:
             ukeire_val = ukeire_quality(hand, d, remain, melds)
         else:
@@ -511,9 +638,41 @@ def discard_decision(hand, remain=None, melds=0, depth=True, dealer=False, fan_o
             score += d1_pen[d]  # D1：喂庄风险 → 该候选更差（同向听内重排）
         if protect_gang and hand[d] >= 4:
             score += gang_keep_pen  # 杠子保留分：不轻易拆可暗杠的四张（同向听 tiebreak）
-        if best_score is None or score < best_score:
+        if best_score is None or score < best_score - 1e-9:
             best_score = score
             best_d = d
+            tied = [d]
+        elif abs(score - best_score) <= 1e-9:
+            tied.append(d)
+    if wait_width == "tiebreak" and wait_tie_eps > 0 and best_score is not None:
+        # 「近似并列」版本：把与最优分相差 ≤ eps×|最优分| 的候选也算进并列集合
+        # （实测多数分歧发生在分数并列时；放宽一点让听口宽度有机会参与定夺）
+        tol = abs(best_score) * wait_tie_eps
+        tied = []
+        for d in pool:
+            if s_map[d] > bound:
+                continue
+            c = list(hand)
+            c[d] -= 1
+            fan = _fan_for(c)
+            if s_map[d] == 0:
+                uv = ting_count(c, remain, melds)
+            elif wait_width == "full":
+                uv = ukeire_wait_width(hand, d, remain, melds)
+            elif baotou_route or not depth:
+                uv = ukeire_quality(hand, d, remain, melds)
+            else:
+                uv = ukeire_depth(hand, d, remain, melds)
+            sc = s_map[d] * shanten_cost - uv * ukeire_w - fan * fan_w * dealer_mult
+            if d1_pen is not None:
+                sc += d1_pen[d]
+            if protect_gang and hand[d] >= 4:
+                sc += gang_keep_pen
+            if sc <= best_score + tol:
+                tied.append(d)
+    if wait_width == "tiebreak" and len(tied) > 1:
+        # P1-a：并列时（实测分歧都发生在并列点）改用「进张 × 落地听口宽度」挑
+        best_d = max(tied, key=lambda d: ukeire_wait_width(hand, d, remain, melds))
     return best_d
 
 

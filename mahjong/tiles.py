@@ -83,6 +83,47 @@ def is_laizi(tile: int) -> bool:
     return tile == LAIZI_INDEX
 
 
+def run_starts(tile: int) -> tuple:
+    """所有可能「包含 tile」的顺子起点 s（顺子 = s,s+1,s+2，同一花色内）。
+
+    tile 可以是顺子的下沿/中间/上沿，因此 s ∈ {tile-2, tile-1, tile}。
+    返回按升序排列，可直接用于拆解枚举。
+
+    为什么需要它（2026-09 线上复核）：旧版拆解只试 s = tile（最低现有牌当下沿），
+    于是「手持 8筒9筒 + 财神，财神补 7筒 成 789筒」这种**财神补顺子下沿**的拆法
+    被漏掉，被降级成两面搭 → 向听数被高估 1。线上实证：2万3万4万 7筒8筒9筒 白
+    （已副露 2 摊）摸 7筒 时应为胡牌，旧版算 0 向听 → 爆头 ×2 漏判，
+    更严重的是 can_hu 判 False 会**把胡牌打掉**。
+    """
+    if not is_number(tile):
+        return ()
+    out = []
+    for s in (tile - 2, tile - 1, tile):
+        if s < 0 or s // 9 != tile // 9 or s % 9 > 6:
+            continue
+        out.append(s)
+    return tuple(out)
+
+
+def pair_completions(a: int, b: int) -> tuple:
+    """两张手牌 (a,b) 要成顺子还需要的那张牌（≤2 种，同花色内）。
+
+    用于「吃这张牌时，我消耗掉的是哪一副搭子」的评估：吃掉之后，
+    这副搭子原本还能靠**自己摸**补上的牌就是 pair_completions − 被吃的那张。
+    """
+    lo, hi = (a, b) if a <= b else (b, a)
+    if not is_number(lo) or hi - lo > 2:
+        return ()
+    out = set()
+    for s in range(max(0, hi - 2), lo + 1):
+        if s // 9 != lo // 9 or s % 9 > 6:
+            continue
+        for t in (s, s + 1, s + 2):
+            if t != a and t != b:
+                out.add(t)
+    return tuple(sorted(out))
+
+
 def tile_name(tile: int) -> str:
     return _TILE_NAMES[tile]
 

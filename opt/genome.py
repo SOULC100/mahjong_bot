@@ -18,6 +18,9 @@ from sim.players import Smart
 EXCLUDE = {"cheat", "remain_mode"}
 # 活跃可搜索维度（结构开关 + 权重；defend/dealer_aware 等已证伪或死维度在 schema 里保留
 # 但不进随机/爬山——Template 负向对照仍可显式给它们）
+# 注：decline_hu / decline_q / decline_max_chain（弃胡+财飘，2026-09-20）**不进 ACTIVE**：
+#     机会频率只有 0~4 次/千局，A/B 分辨不出（会被当噪声随机游走）→ 作为固定部署开关，
+#     由 opt/champion.json 显式带上，保证离线评估与线上 DECLINE_HU 同口径。
 ACTIVE = ["use_chi", "use_peng", "use_gang", "fast", "use_ev", "dealer_policy", "fan_est",
           "angang_tenpai_only", "protect_gang", "knock", "piao_enabled",
           "baotou_slack", "baotou_max_shanten", "gang_keep_pen",

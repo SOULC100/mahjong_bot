@@ -32,8 +32,9 @@ mahjong_bot/
 │   ├── test_smart_bot.py  # 协议层回归（YCB 判胡/吃摊≤2/抓打圈豁免/play 全链路）
 │   └── ...             # 内核测试（fan/shanten/win/ukeire/chi/sim/ycb/dealer）
 ├── docs/               # 文档
-│   ├── guide-v30.txt   # 接入指南权威正文（GET /portal/api/guide?format=text）
-│   ├── roadmap.md      # 迭代路线 + 规则版本 §5（v30 审计、修复清单、真机结果）
+│   ├── guide-v34.txt   # 接入指南权威正文（GET /portal/api/guide?format=text）
+│   ├── rules-strategy.md  # 规则研究 + 收益模型 + 迭代方向（P0：弃胡/财飘、抓打圈、明杠）
+│   ├── roadmap.md      # 迭代路线 + 规则版本 §5（v34 审计、修复清单、真机结果、§2 E 新主线）
 │   └── debug_log.md    # 调试记录（§九 版本漂移审计、§十 真机联调）
 └── data/               # 令牌、真实对局 events、日志、抓取产物
 ```
@@ -49,37 +50,46 @@ mahjong_bot/
 
 财神 = 白板（33），百搭可替代任意牌。
 
-> **2026-09-10 规则更新（live 已到 v30）**：v3 起七对允许财飘（最大番型 ×512）、爆头「摸任意牌即胡」、总番公式重写；v2 快照移除 allowed_actions（客户端自研动作判定）；v7 普通锦标赛多阶段化（stage_open/stage_done、跨阶段 ready、加赛）；v9 测试房数据 API 限速 per-房间；v10 /state 跨局边界立即回全量快照；v11 state 轮询限速放宽至 16/s；v13 分桌按「已确认 ∧ 90s 内在线」+ `/api/match` 成为 auto 房唯一入口；v15 match 默认 M=10/Rounds=8；v21 **白板口径修正**（七对豪华组、4 白板爆头）；v24 删除 `POST /api/users`；v25 服务端强制**吃最多 2 摊**；v26 **抓打圈打财神者本人豁免**（`god.god_discarder_seat`）；v29 全服功能开关（403 `FEATURE_DISABLED`）；v30 他人姓名字段收口（一律昵称/空串，bot 不用 name → 零影响）。
+> **2026-09-18 规则更新（live 已到 v34，2026-09-14 发布）**：v3 起七对允许财飘（最大番型 ×512）、爆头「摸任意牌即胡」、总番公式重写；v2 快照移除 allowed_actions（客户端自研动作判定）；v7 普通锦标赛多阶段化（stage_open/stage_done、跨阶段 ready、加赛）；v9 测试房数据 API 限速 per-房间；v10 /state 跨局边界立即回全量快照；v11 state 轮询限速放宽至 16/s；v13 分桌按「已确认 ∧ 90s 内在线」+ `/api/match` 成为 auto 房唯一入口；v15 match 默认 M=10/Rounds=8；v21 **白板口径修正**（七对豪华组、4 白板爆头）；v24 删除 `POST /api/users`；v25 服务端强制**吃最多 2 摊**；v26 **抓打圈打财神者本人豁免**（`god.god_discarder_seat`）；v29 全服功能开关（403 `FEATURE_DISABLED`）；v30 他人姓名字段收口（零影响）；**v31 局间固定 5 秒停顿（`phase="settled"`；收到 `round_ended` 后立刻 `seq=0` 拿到的是上一局终态，须"再等一拍"）**；**v32 杠爆判定修正（×2 → ×4，与我们 `calc_fan` 的口径一致）**；**v33 杠后补牌改「停弃胡决策窗口」（与普通摸牌同构：可 hu / 续杠 / 弃胡打财神续飘，超时自动胡兜底）**；v34 门户今日榜加「垫底」行（门户-only）。
 >
-> 代码已按 v30 对齐（2026-09-10，见 docs/roadmap.md §5.3）：番型口径修正、YCB 判胡致命 bug 修复、吃摊/抓打圈判定、错误码按 `code` 判型、新增 `/api/match` 客户端与启动版本自检。
-> **权威来源**：指南正文 `docs/guide-v30.txt`（= `GET /portal/api/guide?format=text`）、变更日志 `data/guide_version_changes.txt`、版本 `GET /portal/api/guide/version`、权威番型端点 `POST /portal/api/tools/fan-calc`（均免认证）。
+> 代码已按 v34 对齐（2026-09-18，见 docs/roadmap.md §5.0/§5.3）：番型口径修正、YCB 判胡致命 bug 修复、吃摊/抓打圈判定、错误码按 `code` 判型、`/api/match` 客户端、启动版本自检、`phase="settled"` 处理（v31）。
+> **权威来源**：指南正文 `docs/guide-v34.txt`（= `GET /portal/api/guide?format=text`）、变更日志 `data/guide_version_changes.txt`、版本 `GET /portal/api/guide/version`、权威番型端点 `POST /portal/api/tools/fan-calc`（均免认证）。
 
-## 真机联调（2026-09-10 实测通过）
+> 📐 **策略主线看 `docs/rules-strategy.md`**（2026-09-10 规则研究）：核心结论 `EV ∝ 番型 × (胜率−0.25)`，
+> 真机场均番型只有 1.05 → 番型杠杆几乎没用上；规则明确允许但**引擎与线上都没实现**的
+> 「弃胡打财飘」是当前最大空间（roadmap §2 E1~E3）。该文同时列明模拟器保真度缺口（**没有弃胡、没有抓打圈**）
+> 与因此**不再成立**的旧结论（B1/B2/B4）。
 
-测试房 `t_c84f53481cbf`（M=10 / Rounds=1），连打 2 轮共 **20 局**：
+## 真机联调（累计 4 轮 / 42 局，2026-09-10 起、2026-09-18 补测 v34）
 
 | 指标 | 结果 |
 |------|------|
-| bot 进程 | 4 个全部 exit=0；日志 0 Traceback / 0 线程异常 / 0 409 拒绝 / 0 429 / 0 张数守恒异常 |
-| 出牌超时率 | **0.0%**（两轮共 835 次出牌 0 超时；碰吃窗口走满 3195 次属预期） |
-| 结算 | 20 局 19 胡 1 流局 |
-| 番型对拍 | `calc_fan` vs 服务器 `fan`：**19/19 一致**；再与 `fan-calc` 端点交叉验证 **19/19 一致** |
+| bot 进程 | 4 bot × 4 轮全部 exit=0；日志 0 Traceback / 0 线程异常 / 0 `action 错误` / 0 `409 拒绝` / 0 `429` / 0 `张数守恒异常` |
+| 出牌超时率 | **0.0%**（四轮共约 1700 次出牌 0 超时；碰吃窗口走满属预期） |
+| 结算 | 42 局 41 胡 1 流局 |
+| 番型对拍 | `calc_fan` vs 服务器 `fan` **41/41 一致**；再与免认证 `fan-calc` 端点交叉验证 **41/41 一致**（含一把真机**豪华七对 ×4**） |
 | 规则校验 | 吃摊 ≤2 无越限；抓打圈圈内无越权吃碰；圈内非豁免方出牌均为刚摸牌 **0 违规** |
+| v31 局间停顿 | Rounds=3 房实测出现 `phase=settled（局间 5s 停顿）`，bot 等待后正常接下一局 |
+| 版本自检 | v30 漂移被自动报出；基准 34 后输出 `ok: 服务器 v34 ≤ 本代码已知 v34` |
 
-复现：`python create_room.py`（拿 4 令牌）→ `python live_smoke.py` → `python verify_live.py <归档目录>`。
+复现：`python create_room.py --m 4 --r 3`（拿 4 令牌，**Rounds≥2 才有局间停顿/连庄**）→ `python live_smoke.py`
+→ `python verify_live.py <归档目录>`。
 注意：一个 batch 的事件流会拆成多个 block 续传，`verify_live.py` 按 round 连续回放；
-座位每局重洗（庄家按 seat 0 在用户间轮转），**跨座位比分请按 `user_id` 汇总**（见 `data/_stats_by_user.py`）。
+座位每局重洗（庄家按 seat 0 在用户间轮转，赢家成为下局庄家），**跨座位比分请按 `user_id` 汇总**（`data/_stats_by_user.py`）。
 
 ## 决策引擎策略（优先级从高到低）
 
-1. **能胡就胡**（有财必拷响 YouCaiBiKao 下须**真·爆头**（摸前 13 张任意摸都胡）或**杠开**——判据 `mahjong.fan.ycb_can_hu`，与 `sim/engine._can_win` 同源）
-2. **杠**：有 gang 且 `wall_remaining > 20`（最后 10 墩禁杠）；模拟器含暗杠/补杠/明杠，**线上只做暗杠**（明杠/补杠历史上触发过死循环，且抓打圈内只有暗杠合法）
-3. **碰**：碰后（副露 + 打 1 张）向听数下降才碰；抓打圈内**受限方**不碰（打财神者本人豁免，v26）
-4. **吃**：吃后（副露 + 打 1 张）向听数下降才吃；**最多 2 摊**（v25，按 `melds[seat]` 中 `kind=="chi"` 计数本地自限）
-5. **飘财**：手牌「4 面子 + 2 财神」时打财神（×4 起）
+1. **能胡就胡**（有财必拷响 YouCaiBiKao 下须**真·爆头**（摸前 13 张任意摸都胡）或**杠开**——判据 `mahjong.fan.ycb_can_hu`，与 `sim/engine._can_win` 同源）；**例外：弃胡打财飘**（`DECLINE_HU`，只在「打白后仍爆头」且 q>q\* 时触发，2026-09-20 落地）
+2. **杠**：`wall_remaining > 20`（最后 10 墩禁杠）+ 财神不能杠。**2026-09-21 起线上做全三种**：
+   暗杠（听牌才杠，`angang_tile`）、**明杠**（响应窗口手里 3 张，优先于碰）、**补杠**（自己回合已碰 + 第 4 张）。
+   门控由冻结基准决定「不加门控最好」（关掉明杠 −0.161 分/局）；配 `skip_gang` poison pill 防 409 重提
+3. **碰**：碰后（副露 + 打 1 张）向听数下降才碰；**向听不变但进张质量提升也碰**（`CLAIM_UKEIRE_GATE`，2026-09-21 晋级，+deep 量化见 docs/eval-rounds.md）；抓打圈内**受限方**不碰（打财神者本人豁免，v26）
+4. **吃**：同上（含 ukeire 门控）；**最多 2 摊**（v25，按 `melds[seat]` 中 `kind=="chi"` 计数本地自限）
+5. **飘财**：手牌「4 面子 + 2 财神」时打财神（×4 起）；判据已放宽到 `piao_after_discard`（覆盖七对形财飘）
 6. **爆头路线**：财神做将向听数 ≤ 标准 + 1 时，保留财神走 ×2
-7. **出牌**：向听数最小 → **二次进张深度**（一步前瞻）→ 番型价值
-8. **不打财神**（白板百搭价值高）
+7. **出牌**：向听数最小 → **进张质量**（`ukeire_quality`；听牌层用 `ting_count`）→ 番型价值
+   （注：`ukeire_depth` 对听牌候选恒返回 0 且极慢，**不要打开**；见 docs/improvement-plan.md P1-a）
+8. **不打财神**（白板百搭价值高）——但**弃胡飘**与**被抓打圈限制**是明确例外
 
 注：向听数/进张计算已贯穿 `melds`（副露数），碰/吃/杠后手牌效率评估不再失真。
 

@@ -1,8 +1,8 @@
-接入指南已迁移到单一权威快照：见 docs/guide-v30.txt
+接入指南已迁移到单一权威快照：见 docs/guide-v34.txt
 
 本文件（原 guide-rules.txt）是 2026-09-04 的 v11 静态 DOM 抓取，已过期且与 guide-api.txt 内容重复，
 其「最小 Bot」示例仍使用 v2 起就移除的 allowed_actions 协议，故正文已删除。
 
-- 权威正文：docs/guide-v30.txt（GET /portal/api/guide?format=text）
+- 权威正文：docs/guide-v34.txt（GET /portal/api/guide?format=text）
 - 版本与变更日志：GET /portal/api/guide/version → data/guide_version_changes.txt
 - 修复/影响面记录：docs/roadmap.md §5、docs/debug_log.md §九/§十

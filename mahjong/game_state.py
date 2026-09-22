@@ -12,7 +12,7 @@
 - allowed_actions: ["discard:8w", "pass:", "chi:8t", "peng:发", ...]
 """
 
-from .tiles import NUM_TILES, tile_from_str, empty_counts, hand_from_strs
+from .tiles import NUM_TILES, LAIZI_INDEX, tile_from_str, empty_counts, hand_from_strs
 
 
 class GameState:
@@ -27,6 +27,10 @@ class GameState:
         self.god = {}
         self.my_seat = 0
         self.remain = [4.0] * NUM_TILES  # 牌墙剩余估算（贝叶斯期望张数）
+        # 未见的**原始张数**（4 − 可见，不做牌墙缩放）——与 sim `Game.remain_estimate` 同口径。
+        # 绝对张数类的判据（如 R15「窄搭子」吃门控 narrow_max_accept）必须用它：
+        # 用上面缩放过的 remain 会让同一个阈值在线上/离线含义不同（线上 ≈0.47×，见 §22）。
+        self.raw_unseen = [4] * NUM_TILES
 
     def update_from_snapshot(self, snap):
         """从服务器快照更新局面。"""
@@ -50,15 +54,31 @@ class GameState:
     def _recalc_remain(self):
         """贝叶斯估算每种牌在牌墙中的剩余张数。
 
-        已知可见牌：我的手牌 + 刚摸的 + 所有弃牌。
+        已知可见牌：我的手牌 + 刚摸的 + 所有弃牌 + **4 家副露**（2026-09-21 修正）。
         未见牌分布在「对手暗手」和「牌墙」之间，按比例分配到牌墙。
-        比乐观估算（假设对手暗手为 0）更准确。
+
+        2026-09-21 修正：旧实现漏算副露（只算我的手牌 + 弃牌），已经被吃/碰/杠掉的牌
+        仍被当成"牌墙里还有" → 依赖这些死张的搭子被高估。sim 的 `Game.remain_estimate`
+        一直是算副露的，所以线上/离线的**进张质量输入口径不同**（实测 3.48% 出牌点被翻转，
+        见 `data/_parity_report.txt`；冻结基准里 `live_remain` 方案量化过它的代价）。
+        鸣牌 ukeire 门控（CLAIM_UKEIRE_GATE）依赖这个 remain，口径必须与 sim 一致。
         """
         visible = [0] * NUM_TILES
         for t in range(NUM_TILES):
             visible[t] = self.my_hand[t]  # my_hand 已含刚摸的牌，不再叠加 drawn_tile
             for lst in self.discards:
                 visible[t] += lst.count(t)
+        for row in self.melds:  # 4 家副露都是公开信息（碰/吃/杠各 3~4 张）
+            if not isinstance(row, list):
+                continue
+            for m in row:
+                if not isinstance(m, dict):
+                    continue
+                for s in (m.get("tiles") or []):
+                    try:
+                        visible[tile_from_str(s)] += 1
+                    except Exception:  # noqa: BLE001 - 未知牌面字符串不计入估算
+                        continue
 
         # 对手暗手张数（从 hand_counts 推断）
         my_hand_cnt = sum(self.my_hand)
@@ -69,11 +89,12 @@ class GameState:
 
         total_unseen = self.wall_remaining + hidden_opp
         remain = [0.0] * NUM_TILES
+        self.raw_unseen = [max(0, 4 - visible[t]) for t in range(NUM_TILES)]
         if total_unseen <= 0:
             self.remain = remain
             return
         for t in range(NUM_TILES):
-            unseen_t = max(0, 4 - visible[t])
+            unseen_t = self.raw_unseen[t]
             remain[t] = unseen_t * self.wall_remaining / total_unseen
         self.remain = remain
 
@@ -116,6 +137,33 @@ class GameState:
             if str(m.get("kind", "")).lower() == "chi":
                 n += 1
         return n
+
+    def peng_meld_tiles(self):
+        """本人**已碰**的牌（tile 索引列表；碰后手里再摸到第 4 张即可补杠）。
+
+        解析不出（老格式/字段缺失）返回 [] = 不做补杠（保守），不抛异常。
+        """
+        out = []
+        if not (0 <= self.my_seat < len(self.melds)):
+            return out
+        row = self.melds[self.my_seat]
+        if not isinstance(row, list):
+            return out
+        for m in row:
+            if not isinstance(m, dict):
+                continue
+            if str(m.get("kind", "")).lower() != "peng":
+                continue
+            tiles = m.get("tiles") or []
+            if not tiles:
+                continue
+            try:
+                t = tile_from_str(tiles[0])
+            except Exception:  # noqa: BLE001 - 未知牌面字符串跳过
+                continue
+            if t != LAIZI_INDEX:  # 财神不能被碰/杠（防御性）
+                out.append(t)
+        return out
 
     def piao_count(self):
         """动作链计数（杠/飘连乘 ×2）。服务端字段为 chain_count（2026-09-03 更正），

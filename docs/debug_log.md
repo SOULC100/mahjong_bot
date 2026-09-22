@@ -1,4 +1,4 @@
-# mahjong_bot 调试记录（2026-09-02 起；§九 为 2026-09-10 版本漂移审计）
+# mahjong_bot 调试记录（2026-09-02 起；§九 版本漂移审计、§十 真机联调均为 2026-09-10）
 
 > 记录本轮真实对局调试发现的所有问题、修复、以及未解决的核心矛盾。
 
@@ -138,13 +138,19 @@
 
 ## 九、指南版本漂移审计与修复（2026-09-10）
 
+> 后续（同日真机联调时）：服务器又发布 **v30**（他人姓名字段收口，schema 不变、bot 零影响），
+> 自检立刻报出 → 已把 `KNOWN_GUIDE_VERSION` 提到 30、权威正文换成 `docs/guide-v30.txt`
+> （该文件名会随版本滚动：**当前权威正文是 `docs/guide-v34.txt`**，见 §十一）。
+> 本节记录的是 v11→v29 的那次漂移审计，结论仍然成立。
+
 ### 起因
 
 手工拉 `GET /portal/api/guide/version`：**服务器 v29（updated_at 2026-09-09）**，而本仓库文档快照是
 **v11（2026-09-04）**，落后 18 个版本。指南 §2.2 本来就要求 bot 启动时做版本自检——没做，于是漂移了 5 天。
 
 抓取产物：`data/guide_version_raw.json`（版本+53 条变更）、`data/guide_version_changes.txt`（变更全文）、
-`docs/guide-v29.txt`（`GET /portal/api/guide?format=text` 权威正文，取代旧的 guide-api/guide-rules v11 快照）。
+`docs/guide-v29.txt`（`GET /portal/api/guide?format=text` 权威正文，取代旧的 guide-api/guide-rules v11 快照；
+现已滚动为 `docs/guide-v34.txt`）。
 
 ### 发现的代码问题（严重度排序）
 
@@ -182,6 +188,99 @@ v17/v20/v22/v23/v27/v28（门户-only）。
 - 线上仍只做暗杠（明杠/补杠待做）。
 - `decision._fan_ting_expect` 调 `calc_fan` 不传 `baotou`（仅 `fan_est=real*` 用到，B4 已证伪）。
 - 番型口径改动后基线未重跑（旧 A/B 数值引用需谨慎）。
-- 遗留脚本：`bot.py`/`debug_bot.py` 是 allowed_actions 时代产物（v2+ 必失效）；`wait_room.py` 等的 `"全部完成"` 只有 `bot.py` 打印；`fetch_room_stats.py` 按 `batch` 命名存档，v4 跨轮复用后每轮 batch 从 0 重号会互相覆盖。
+- 遗留脚本：`bot.py`/`debug_bot.py` 是 allowed_actions 时代产物（v2+ 必失效）；`wait_room.py` 等的 `"全部完成"` 只有 `bot.py` 打印。
+
+## 十、真机联调（2026-09-10）：跑通、零报错、20 局全量校验
+
+### 环境与起局
+
+- 门户会话过期（`data/portal_session.json` 的 `majiang_sid` 已失效 → `401 session expired`），改走
+  `~/.config/netease_auth` 凭据 + `create_room.py`（Playwright 自动登录）→ 新建测试房 **`t_c84f53481cbf`**，
+  4 个令牌落 `data/tokens.txt`。
+- 房规：`M=10 / Rounds=1 / BaseScore=1 / YouCaiBiKao=false / Kind=test / TimeoutMin=30`。
+- 连打 2 轮（各 10 局），编排与校验脚本：`live_smoke.py`（并发 4 bot + 归档 + 日志扫描）、
+  `verify_live.py`（事件回放校验）、`data/_stats_by_user.py`（按 user 汇总）。
+
+### 结果：能不能跑通 —— 能，且零报错
+
+| 维度 | 结果 |
+|------|------|
+| 进程 | 4 bot × 2 轮全部 exit=0 |
+| 日志关键字 | `Traceback`=0、`线程异常`=0、`action 错误`=0、`409 拒绝`=0、`429`=0、`张数守恒异常`=0（8 个日志文件全清） |
+| 出牌超时 | **0.0%**（第 1 轮 439 出牌、第 2 轮 396 出牌，`timeout.discard` 均为 0） |
+| 窗口走满 | `timeout.response` 1682 + 1513（碰/吃窗口固定走满，bot 不 POST pass，属预期） |
+| 结算 | 20 局 19 胡 1 流局 |
+| 番型对拍 | `calc_fan` vs 服务器 `round_ended.data.fan` **19/19 一致**；同手牌再打免认证 `fan-calc` **19/19 一致**；分布 = 18 平胡 + 1 七对 |
+| v25 吃摊 ≤2 | 0 越限；3 局出现某座位吃满 2 摊（本地门禁被真实触发过） |
+| v26 抓打圈 | 0 违规（圈内无非豁免方吃/碰/明杠；圈内非豁免方出牌 = 刚摸牌） |
+| F 错误码容忍 | 真机日志 `进场 register/ready 被拒（409 TOURNAMENT_STARTED），按最新 status 继续`——不崩 |
+| H 版本自检 | 第 1 轮打出 `⚠️ 服务器接入指南 v30 > 本代码已知 v29`（当天服务器又发了 v30）；核对后基准升 30，第 2 轮输出 `ok: 服务器 v30 ≤ 本代码已知 v30` |
+| 轮询自限 | `POLL_INTERVAL = 0.075s（≈13.3/s，赛事 M=10）`，全程 0 次 429 |
+
+### 联调中发现并修掉的两个问题
+
+1. **取证脚本跨轮覆盖（真机复现）**：房间累计 20 条局列表，`fetch_room_stats.py` 按 `batch` 命名存档 →
+   第 2 轮把第 1 轮的 `events_0..9.json` 全部覆盖（`games.json` 20 条、实际落盘 10 个文件，且全是 `r2_*`）；
+   免认证数据端点按 batch 也只回**当前轮**，第 1 轮事后不可得。
+   修复：文件名改 `events_r{round}_b{batch}.json`；拉到的 `game_id` 与局列表期望值不符则跳过并计入
+   `summary.json` 的 `unavailable_old_rounds`；汇总行区分「房间场次总数 / 本次可统计」。
+2. **座位与庄家口径**：`seats[]` 是座位序数组，实测每局重洗（10 局里 9 局与首局不同），而 `dealer` 恒为 seat 0
+   ——庄家身份在用户间轮转。**跨座位聚合比分是错的**（第 1 轮按 seat 看 seat0 = −24、seat1 = +19，纯属混淆），
+   必须按 `user_id` 汇总（第 1 轮按 user：青龙 +76 / 白虎 −49 / 朱雀 +1 / 玄武 −28）。
+   另：`features` 免认证端点同样有 5/s 限速，并发探测会 429（代码按"查不到当开启"兜底）。
+
+### 样本覆盖不足（未在真机覆盖的路径）
+
+20 局里没有 `catch_play=true`（无人打财神）、没有杠、没有爆头/财飘/4 白板大番型，因此：
+
+- v21 的大番分支（4 白板豪华组、4 白爆头）、v26 豁免方吃碰续飘、`gang_kai_armed` 杠开豁免
+  **只在单元测试与 fan-calc 对拍层面验证**，真机未触达。
+- 要真机覆盖需更多局（大番型概率低）或构造房规（提高 Rounds / 专门脚本逼出财飘）。
+- 另记一条 micro-gap：庄家首巡第 14 张无 `tile_drawn`，`can_hu` 要求"有摸牌才判胡" → **天胡不会被判胡**
+  （概率极低；历史上该门禁是挡「碰后假胡」死循环的，动它需先能区分两种 14 张无 drawn 情形）。
+
+## 十一、v31–v34 复核 + 多局房真机验证（2026-09-18）
+
+### 版本
+
+`GET /portal/api/guide/version` → **v34（updated_at 2026-09-14）**，本地基准此前是 v30 → 中间 4 个版本：
+
+| 版本 | 类型 | 要点 | 代码结论 |
+|------|------|------|---------|
+| v31 | changed | 局间固定停 5 秒：窗口内 `phase="settled"`、`round_no` 仍是上一局、任意 seq 都拿到上一局终态 | 见下（新增 settled 处理 + 2 条单测） |
+| v32 | changed | **杠爆判定修正**：摸牌后杠的爆头状态改在杠动作时重算（修前被静默判成普通杠开 ×2，应为 ×4） | **零改动**：`fan.py` 的「爆头×2 × 杠开×2」本就是 ×4；此修复让**我们的自研校验（`verify_live.py`）与服务器终于一致** |
+| v33 | changed | **杠后补牌停弃胡决策窗口**：补牌与普通摸牌同构（`phase=draw`、`drawn_tile=补牌`、事件带 `gang_replenish:true`），可 hu / 续杠 / **弃胡打财神续飘**，超时自动胡兜底 | **零改动**（指南⑤：主动判胡的 bot 零改动）：`gang_kai_armed` 置位 → 补牌 `tile_drawn(me)` 触发快照 → 以 `gang_kai=True` 判胡。**v33 把"弃胡续飘"写进补牌窗口 → 我们的 E1 适用面扩大** |
+| v34 | added | 门户今日榜加 `last`（垫底）行，完全匿名 | 门户-only，零影响 |
+
+### 代码检查结果
+
+1. **`KNOWN_GUIDE_VERSION` 30 → 34**（真机日志确认：`接入指南版本自检 ok: 服务器 v34 ≤ 本代码已知 v34`）。
+2. **`play()` 新增 settled 处理**（v31）：识别 `phase="settled"` → 记一次日志、清 `gang_kai_armed`（防跨局误判杠开）、继续用当前 seq 轮询等下一局；
+   单测新增两条（settled 不发动作 / settled 后能继续处理下一局）。
+3. **`verify_live.py` 支持杠局**（呼应 v32）：此前杠局因"全手 15 张"被整体跳过；现按「每个 4 张副露折算 3 张」归一化到 14 张等效，杠爆局也能做番型对拍。
+4. **守恒公式复核（结论：无需改）**：曾怀疑「暗杠后 `sum(hand)+3*melds` 少 1」会误报 `张数守恒异常`，
+   推导后确认**杠的 4 张恰好被杠后补牌抵消**（杠后 concealed 11 + 3×1 melds = 14 ✓），现有校验正确。
+5. **`create_room.py` 改为走门户 API**（`POST /portal/api/test-rooms`，蛇形 body）：旧实现靠抓 DOM 里的 64-hex，
+   实测会因渲染时序偶发"提取令牌失败"（房间其实已建好）；API 版直接从响应 JSON 取 `room_id` + 4 `tokens`，
+   并支持 `--m/--r/--base/--ycb` 指定房规（**Rounds≥2 是验证 v31 局间停顿与连庄的必要条件**）。
+6. **两个"服务端先于文档"的发现**：
+   - `GET /portal/api/features` 现在返回 **4 个** 开关：`{match_enabled, replay_enabled, substitute_enabled, test_rooms_enabled}`，
+     后两个键在 v34 指南正文与变更日志里**都查不到**（`features` 字样在正文出现 0 次）。我们只读 `match_enabled`（用途正确），其余**记录待观察**。
+   - `POST /portal/api/test-rooms` 有配额：**409 `QUOTA_EXCEEDED`（an active test room already exists）**，v34 错误码表亦未收录。
+
+### 真机验证（v34）
+
+- 第 3 轮（新房 `t_6e00736f97c5`，M=10/Rounds=1）：4 bot 全 exit=0、10 局 10 胡、日志零错误、
+  `verify_live.py` 番型 **10/10 一致**（`calc_fan` 与 `fan-calc` 双对拍）、0 违规。
+- 第 4 轮（`t_39891e80399a`，**M=4 / 每场 3 局**，共 12 局）：
+  - 4 bot 全 exit=0、日志零错误、0 出牌超时；12 局 12 胡、番型对拍 **12/12 一致**、0 违规。
+  - **v31 局间停顿实测复现**：日志出现 `phase=settled（局间 5s 停顿）round_no=N，等待下一局`（4 个 bot 均有），
+    等待后正常接下一局（单局房 Rounds=1 测不到，这也是把 `create_room.py` 改成支持 `--r` 的原因）。
+  - **豪华七对 ×4 真机验证**：`4t4t5t5t6t6t7t7t4b4b4b6b6b` 摸 `4b` → `4b` 成组四张 → 服务器 `detail=['豪华七对×1']`/`fan=4`，
+    `calc_fan`=4、`fan-calc`=4 三方一致 —— 直接验证了 v21① 修正后的七对分支因子。
+  - **庄家轮转规则确认**：`rounds[].dealer` 显示「赢家成为下一局庄家、庄家自己赢则续坐」
+    （`dealer0→winner2` ⇒ 下局 dealer=2；`dealer2→winner2` ⇒ 下局仍 dealer=2；`dealer0` 连赢两局则连续当庄）。
+    → `sim` 未建模这条（引擎 dealer 固定），已记入 `rules-strategy.md` 的保真度清单，E6 前要补。
+- 累计 4 轮 42 局：41 胡 1 流局、番型对拍 41/41 一致、违规 0。
 
 

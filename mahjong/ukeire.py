@@ -67,6 +67,37 @@ def ukeire_quality(counts, d, remain=None, melds=0):
     return score
 
 
+def ukeire_wait_width(counts, d, remain=None, melds=0):
+    """打掉 d 后的「进张 × **落地听口宽度**」期望（P1-a 的便宜解析式，2026-09-20）。
+
+    与 `ukeire_quality` 的唯一区别：摸到进张 t 后**已经是听牌**（s2==0）时，权重不再是常数 4，
+    而取「落地后能胡的加权张数」`ting_count(c2)`——这样 3 张听的愚形 < 8 张听的两面。
+    其余层（s2>=1）保持 `1 + max(0, 3-s2)`，量纲与 ukeire_quality 可比（听牌层权重 3~8 vs 原来的 4）。
+    """
+    c = list(counts)
+    c[d] -= 1
+    base = shanten(c, melds)
+    if remain is None:
+        remain = [4] * NUM_TILES
+    score = 0.0
+    for t in range(NUM_TILES):
+        if remain[t] <= 0:
+            continue
+        c2 = list(c)
+        c2[t] += 1
+        s2 = shanten(c2, melds)
+        if s2 >= base:
+            continue
+        if s2 == -1:
+            w = 4.0                                   # 摸到即胡
+        elif s2 == 0:
+            w = float(ting_count(c2, remain, melds))  # 落地听口宽度（愚形 ~3 / 两面 ~8）
+        else:
+            w = 1 + max(0, 3 - s2)                    # 与 ukeire_quality 一致
+        score += remain[t] * w
+    return score
+
+
 def ukeire_depth(counts, d, remain=None, melds=0):
     """打掉 d 后的二次进张期望（一步前瞻）。
 

@@ -12,7 +12,7 @@
 
 from functools import lru_cache
 
-from .tiles import NUM_TILES, LAIZI_INDEX, is_number
+from .tiles import NUM_TILES, LAIZI_INDEX, is_number, run_starts
 from .win import split_laizi, can_win
 
 
@@ -90,9 +90,11 @@ def _mp(tiles, laizi, groups) -> int:
         if tiles[i] >= use and (3 - use) <= laizi:
             best = max(best, 2 + _mp(_sub(tiles, i, use), laizi - (3 - use), groups - 1))
 
-    # 完整顺子 i,i+1,i+2（缺的用财神补）-> 面子 +2
-    if is_number(i) and i % 9 <= 6:
-        nt, miss = _remove_seq(tiles, i)
+    # 完整顺子 s,s+1,s+2（缺的用财神补）-> 面子 +2
+    # s 遍历所有包含 i 的顺子起点：s 可低于 i（**财神补下沿**，如 8筒9筒+财神 = 789筒），
+    # 也可等于 i（财神补中间/上沿）。旧版只试 s=i，漏了下沿 → 向听数高估 1。
+    for s in run_starts(i):
+        nt, miss = _remove_seq(tiles, s)
         if miss <= laizi:
             best = max(best, 2 + _mp(nt, laizi - miss, groups - 1))
 

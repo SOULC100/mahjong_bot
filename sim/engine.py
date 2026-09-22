@@ -128,7 +128,8 @@ class Game:
                     # 明杠：补牌 + 杠开检查（YCB 下杠开豁免爆头，gang_kai=True）
                     rt = self._kang_draw()
                     self.hands[claimer][rt] += 1
-                    if self._can_win(claimer, drawn_tile=rt, gang_kai=True):
+                    if self._can_win(claimer, drawn_tile=rt, gang_kai=True) and \
+                            strategies[claimer].want_hu(self, claimer, rt, True):
                         return self._win_result(claimer, gang_kai=True, drawn_tile=rt)
                 d = strategies[claimer].choose_discard(self, claimer)
                 self._discard(claimer, d)
@@ -137,12 +138,14 @@ class Game:
             # 无人要：cur 摸牌
             t = self._draw()
             self.hands[cur][t] += 1
-            if self._can_win(cur, drawn_tile=t, gang_kai=False):
+            if self._can_win(cur, drawn_tile=t, gang_kai=False) and \
+                    strategies[cur].want_hu(self, cur, t, False):
                 return self._win_result(cur, gang_kai=False, drawn_tile=t)
             if self._try_own_gang(strategies, cur, t):
                 rt = self._kang_draw()
                 self.hands[cur][rt] += 1
-                if self._can_win(cur, drawn_tile=rt, gang_kai=True):
+                if self._can_win(cur, drawn_tile=rt, gang_kai=True) and \
+                        strategies[cur].want_hu(self, cur, rt, True):
                     return self._win_result(cur, gang_kai=True, drawn_tile=rt)
             d = strategies[cur].choose_discard(self, cur)
             self._discard(cur, d)
@@ -154,14 +157,13 @@ class Game:
         self.discards[seat].append(tile)
         self.last_discard_tile = tile
         self.last_discard_seat = seat
-        # 财飘跟踪：打财神且手里仍留 ≥1 财神（=「4面子+2财神打1财神」的飘）→ piao+1；
-        # 打财神但手上已无财神（如 youcai_bikao 弃最后一张财神逃平胡）→ 非飘，链断；
-        # 打非财神 → 飘财状态消失（下一轮没胡，飘的链断）。
-        if tile == LAIZI_INDEX:
-            if self.hands[seat][LAIZI_INDEX] >= 1:
-                self.piao_count[seat] += 1
-            else:
-                self.piao_count[seat] = 0
+        # 财飘跟踪（2026-09-20 修正为规则口径，guide §1.2）：
+        # 「飘」= 打出财神**且打完后仍「任意摸都胡」**（爆头态续听），此时动作链 +1；
+        # 打出非飘非杠的牌（含**非爆头态**打白板）→ 链断重新计数。
+        # 旧实现只判「手里还剩 ≥1 张白」就记飘 → 实测 2000 局里 1716 次非法记账（虽未进入结算），
+        # 一旦打开弃胡就会把飘的价值算高，故与 mahjong.decision.piao_after_discard 对齐。
+        if tile == LAIZI_INDEX and any_draw_win(self.hands[seat], len(self.melds[seat])):
+            self.piao_count[seat] += 1
         else:
             self.piao_count[seat] = 0
 

@@ -6,8 +6,8 @@
   "fast": true,
   "dealer_aware": false,
   "use_ev": true,
-  "peng_ukeire_gate": false,
-  "chi_ukeire_gate": false,
+  "peng_ukeire_gate": true,
+  "chi_ukeire_gate": true,
   "peng_gate_max_shanten": null,
   "piao_enabled": true,
   "piao_dealer_only": false,
@@ -22,13 +22,17 @@
   "angang_tenpai_only": true,
   "protect_gang": true,
   "knock": false,
-  "ycb_escape_gap": 0,
+  "ycb_escape_gap": 1,
   "dealer_policy": "aggr",
+  "decline_hu": true,
+  "decline_q": 0.75,
+  "decline_max_chain": 3,
+  "chi_prefer_narrow": true,
   "shanten_cost": 100.0,
   "ukeire_w": 0.1,
   "fan_weight": 5.0
  },
- "version_id": "e87f55a516",
- "promoted_at_round": "r_refresh",
- "note": "schema refresh incl weights"
+ "version_id": "58a85a8c40",
+ "promoted_at_round": "r15",
+ "note": "schema refresh incl weights；2026-09-20 追加 decline_hu（规则落地：弃胡+财飘）；2026-09-21 **冻结基准晋级**：chi_ukeire_gate/peng_ukeire_gate false→true（both_gate：3000 局配对 Δ分 +0.326 / z=3.42）；**ycb_escape_gap 0→1**（YCB 专项：3000 局 YCB 配对 Δ分 +1.571 / z=8.52、Δ胜率 +2.93pp / z=5.23 —— 非 YCB 下该参数不参与决策，惰性）；2026-09-25 **R15 晋级 chi_prefer_narrow=true**（吃多解时先消化\"自己摸不进来\"的那副搭子：3000 局配对 Δ分 +0.265 / z=2.66、场均番 1.108→1.170；同期\"向听≥3 不吃宽搭子\"未通过确认，已归档）。version_id 未重算 hash"
 }

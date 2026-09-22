@@ -1,8 +1,8 @@
-接入指南全文 —— guide v30（2026-09-10）
+接入指南全文 —— guide v34（2026-09-14）
 
 来源：GET /portal/api/guide?format=text（免认证，每 IP 5/s，与门户「接入指南」Tab 同源）
-版本：GET /portal/api/guide/version → version=30、updated_at=2026-09-10
-抓取时间：2026-09-10（本地核对；真机烟测同日通过，见 docs/debug_log.md §十）
+版本：GET /portal/api/guide/version → version=34、updated_at=2026-09-14
+抓取时间：2026-09-18（本地核对；真机烟测同日/近日通过，见 docs/debug_log.md §十/§十一）
 重新抓取：python data/_gen_guide_doc.py --fetch
 
 说明：
@@ -10,8 +10,8 @@
   且内容互为副本、含门户页面噪声，其「最小 Bot」示例还是 v2 之前用 allowed_actions 的旧协议）。
 - 正文里 §1.5 / 榜单说明等段落含少量门户 UI 文字（如「点牌或 ＋ 选牌」「重置默认牌型」），
   是 text 格式剥离标签后的残留，不影响协议部分。
-- 变更日志见 data/guide_version_changes.txt（54 条，v30→v1 全量 detail）。
-- 上线 bot 的版本自检基准：smart_bot.py 的 KNOWN_GUIDE_VERSION（当前 = 30）。
+- 变更日志见 data/guide_version_changes.txt（58 条，v34→v1 全量 detail）。
+- 上线 bot 的版本自检基准：smart_bot.py 的 KNOWN_GUIDE_VERSION（当前 = 34）。
 
 ================================================================================
 
@@ -39,7 +39,7 @@
 
 • 爆头：听牌态摸任意 1 张牌上来即胡（财神数不限，支持副露；正好 4 张白板亦按此判定——4 白听任意即胡时计爆头并与「4 个白板 ×2」叠加，2026-09-07 修订）。
 
-• 弃胡：摸牌后不强制自动胡——客户端自行判胡（快照无 allowed_actions），可提交 hu，也可弃胡打牌（飘/杠链前提）；可胡但超时未响应 → 服务端自动胡兜底。
+• 弃胡：摸牌后不强制自动胡——客户端自行判胡（快照无 allowed_actions），可提交 hu，也可弃胡打牌（飘/杠链前提）；可胡但超时未响应 → 服务端自动胡兜底。杠后补牌同一口径（2026-09-13 起）：杠（暗杠/补杠/明杠）补到的牌即使能胡也不自动结算，照常进入决策窗口（可提交 hu、可续杠、可弃胡打财神续飘），超时同样自动胡兜底。
 
 1.3 番型倍率（在自摸基础上连乘）
 
@@ -190,19 +190,19 @@ config 字段含义：
 
  | /api/tournaments/me/ready | POST | 到位（报名令牌直达；全局令牌返回 400 TOKEN_NOT_SCOPED）
 
- | /api/tournaments/{id}/register | POST | 报名（开赛前；幂等；校验同时 16 场上限）
+ | /api/tournaments/{id}/register | POST | 报名（开赛前；幂等；不占额度——2026-09-14 起报名是纯意向，不建房间、不消耗服务器资源，16 场上限不适用于报名）
 
  | /api/tournaments/{id}/ready | POST | 到位（开赛前；幂等；须先报名）。新建赛事分桌只认开赛时刻 ≤90s 内有已认证请求者（连上又断开会被剔除）
 
  | /api/tournaments/{id} | GET | 锦标赛状态：status / config / 报名与 ready 人数 / 我的比赛 my_games / ranking 排名 / voided 原因（仅参赛者可查）。多阶段锦标赛另含阶段字段组（stage / stage_status / stage_crashed / qualified / qualify_role）——见 §2.6
 
- | /api/games/{id}/state?seq=N | GET | 长轮询状态与事件流：seq=0 返回全量快照（含你的手牌、座位 seat、窗口成员 responding_seats 等自主决策字段）；seq=N 返回 N 之后的新事件；无新事件时挂起最多 30s 后返回 {"pending":true}；seq 落后当前局（round_ended 后新局已发牌、不产生事件）→ 立即返回全量快照（gap:true）
+ | /api/games/{id}/state?seq=N | GET | 长轮询状态与事件流：seq=0 返回全量快照（含你的手牌、座位 seat、窗口成员 responding_seats 等自主决策字段）；seq=N 返回 N 之后的新事件；无新事件时挂起最多 30s 后返回 {"pending":true}；seq 落后当前局（round_ended 后新局已发牌、不产生事件）→ 返回全量快照（gap:true）。局间暂停（v31）：每局结束停 5 秒才发下一局，这 5 秒内快照为上一局终态（phase="settled"、round_no 仍是上一局），发牌那一刻挂起中的轮询被唤醒并收到新局全量快照
 
  | /api/games/{id}/notify | GET | SSE 通知流（v12 起，服务器推送）：连接即收初始帧 {"seq":N}（当前事件水位）；此后每次状态变更（出牌/摸牌/吃/碰/杠/胡/流局/超时等任意事件）推 {"seq":新水位}——帧只含 seq 信号，不含变化内容；每 30s 一行 : keepalive 维持连接；场终/死场推 {"seq":N,"closed":true} 后关流。收帧后按需 GET /state?seq=本地 拉增量（跨局/落后>256 自动回全量快照）。每用户 32 并发连接（429），不占 /state 的 16/s 频率额度
 
  | /api/games/{id}/action | POST | 提交动作：{"action":"discard|chi|peng|gang|hu|pass","tile":"1w"}——服务端纯验证：合法即执行、不合法 409（动作合法性客户端自研判定，快照无 allowed_actions）；吃可附加 "tiles":["1w","2w"] 指定用哪两张手牌吃（多组合时可选择），缺省服务端取第一组可行顺子
 
- | /api/match | POST | 自动匹配建房与入席（v13 起，全自动）：用全局 token——仅收门户绑定身份（「我的 AI 身份」签发或管理面造号；存量匿名全局令牌 403 PORTAL_BINDING_REQUIRED，v24 起；报名令牌 400 TOKEN_NOT_SCOPED）。服务端从自动匹配池（只含系统按默认配置自动创建的自动房，kind=auto）按就绪席多、开赛早者优先选房入席，无可兼容候选则自动建新房并把你作为首位入席——成功返回 {room_id, config, round_no}，之后用同一全局 token 照常参赛（GET /api/tournaments/{room_id} 的 my_games 发现场次、/state 轮询、/action 出招）。等待期重复调用幂等返回原房，绝不双房双席。body 可选 {"M":10,"Rounds":8}（小写键亦收）声明可承受上限（≤ 过滤——上限须 ≥ 服务默认；缺省/键 ≤0 = 不限）；显式上限低于服务默认（M=10、Rounds=8，v15 起）→ 404 NO_ROOM_AVAILABLE（永久条件，不重试）。满 4 人即开 M=10 场并发对局 × 每场 8 局（同一 4 人、座次逐场重洗，最晚场终后结算——单会话样本 80 手/人）。整场打完（finished 约 60s 宽限）自动房自动关停，玩家 API 对该房一律 404——赛果以最后一次 /state 快照与门户复盘为准；再打重调本端点（每次新会话新房）。限速 10 次/分/用户。管理员可在正式比赛期间关闭自由匹配（v29）：此时新的匹配请求返回 403 FEATURE_DISABLED（永久条件，勿重试）——已在房中的用户重调仍 200 返回原房，进行中的对局照常打完
+ | /api/match | POST | 自动匹配建房与入席（v13 起，全自动）：用全局 token——仅收门户绑定身份（「我的 AI 身份」签发或管理面造号；存量匿名全局令牌 403 PORTAL_BINDING_REQUIRED，v24 起；报名令牌 400 TOKEN_NOT_SCOPED）。服务端从自动匹配池（只含系统按默认配置自动创建的自动房，kind=auto）按战力相近优先选房入席——优先与你的近期战绩最接近的房；战力差距过大且无法新建房时并入最近的房（在线人数过少时退回按就绪席多、开赛早者优先）。无可兼容候选则自动建新房并把你作为首位入席——成功返回 {room_id, config, round_no}，之后用同一全局 token 照常参赛（GET /api/tournaments/{room_id} 的 my_games 发现场次、/state 轮询、/action 出招）。等待期重复调用幂等返回原房，绝不双房双席。body 可选 {"M":10,"Rounds":8}（小写键亦收）声明可承受上限（≤ 过滤——上限须 ≥ 服务默认；缺省/键 ≤0 = 不限）；显式上限低于服务默认（M=10、Rounds=8，v15 起）→ 404 NO_ROOM_AVAILABLE（永久条件，不重试）。满 4 人即开 M=10 场并发对局 × 每场 8 局（同一 4 人、座次逐场重洗，最晚场终后结算——单会话样本 80 手/人）。整场打完（finished 约 60s 宽限）自动房自动关停，玩家 API 对该房一律 404——赛果以最后一次 /state 快照与门户复盘为准；再打重调本端点（每次新会话新房）。限速 10 次/分/用户。管理员可在正式比赛期间关闭自由匹配（v29）：此时新的匹配请求返回 403 FEATURE_DISABLED（永久条件，勿重试）——已在房中的用户重调仍 200 返回原房，进行中的对局照常打完
 
  | /api/test-rooms/{id}/games | GET | 测试房间局列表（免认证）：[{batch, game_id, status}]，batch 升序——每局结束即可按需拉取（跨轮房间含全部轮次历史）
 
@@ -238,6 +238,17 @@ config 字段含义：
         games 数据完好照常入榜（得分真实），但其战绩按当时库中可读胡行计——早期长局 rounds 每场仅尾部
         1–2 行，冠军行可显示 wins=0（页面灰「—」），属历史缺口、不补录。
 
+        今日榜「垫底」行（v34 起）：积分榜端点 GET /portal/api/leaderboard
+        响应新增 last 键 = 当日总积分最低的那一位（该窗口排序链的最后一行），字段恒为
+        {rooms, firsts, score, is_me} 四键或 null —— 三个数字与该用户在主榜行上的
+        场次/首名/积分含义完全相同。页面把它画成表格第一行、名次格放财神爷捧元宝头像
+        （images/caishen.png，圆形位图、无文字，语义挂在该 <img> 的
+        alt/title 上，显示 36px）、昵称格固定显示
+        「大家好，我是众神的大血包」（文案与版式属展示层，不在响应里）。身份一律不下发：last 里没有
+        rank、没有 user_id、没有 name，is_me 只对请求者本人为
+        true。只有今日榜有（period=all|week 恒 null），且当日上榜人数 ≤32 时也恒
+        null——人少时垫底那位本来就在 top 32 行里按真名可见，再下发他的真实战绩等于当场点名。
+
         上期前四置顶（v27 起，今日榜/周榜）：积分榜端点 GET /portal/api/leaderboard
         响应新增 prev 键——上一期前四名 + 请求者 uid + 上一期第一名的连续霸榜期数；
         period=all 时为 null，仅 today|week 有值。字段 =
@@ -260,7 +271,7 @@ config 字段含义：
 
 • 失步恢复：发现缺口（响应含 gap:true）或动作 409 后，用 seq=0 重建全量快照。
 
-• 跨局边界（v10 起）：每局结束（round_ended）后新局自动发牌不产生任何事件——事件流在新局首个动作前为空，庄家第 14 张为发牌直抽、无摸牌事件。此时继续用上一局末的 seq 轮询会立即收到新局全量快照（gap:true，含你的新局手牌 my_hand/round_no/phase），不会挂起至庄家出牌超时自动出牌；新局手牌一律以快照为准。
+• 跨局边界（v10 起，v31 修订）：每局结束（round_ended）后新局自动发牌不产生任何事件——事件流在新局首个动作前为空，庄家第 14 张为发牌直抽、无摸牌事件。此时继续用上一局末的 seq 轮询，最多 5 秒后收到新局全量快照（gap:true，含你的新局手牌 my_hand/round_no/phase），不会挂起至庄家出牌超时自动出牌；新局手牌一律以快照为准。v31 起每局结算后固定停 5 秒才发下一局（此前是结算瞬间立即发牌，时长服务端写死不可配）——这 5 秒内快照为上一局终态（phase="settled"、round_no 仍是刚结束那一局、waited_seat=-1），即「本局已结算、下一局尚未开始」：此时 my_hand / hand_counts 给的是上一局剩下来的牌、并非新局手牌（scores 已含本局得分），拿它算牌会错；提交任何动作一律 409 INVALID_ACTION（与「动作非法」同码，务必按 code 判型、勿看 message），此时应把 phase="settled" 当作「再等一拍」的信号，不必 seq=0 反复重建。服务端在发牌那一刻唤醒挂起中的轮询并下发新局快照，故轮询循环无需任何改动、超时预算也不必调整（5 秒 ≪ 30 秒长轮询上限）。
 
 • round_ended 自带局号/庄键（v19 起）：每局结束的 round_ended 事件——胡牌（draw:false）与流局（draw:true）同款——携带 round_no（本局局号，1 基）/ dealer（本局庄家座）两键，按序消费无需自行推导；纯加性负载，旧 bot 忽略未知键零影响（新键可作复盘/统计/跨局对账依据）。
 
@@ -272,7 +283,7 @@ config 字段含义：
 
 • 自研动作判定（v2 起，快照无 allowed_actions）：客户端依快照字段自判可执行动作——seat（本人座位，观赛 -1）、phase（deal|draw|response_peng|response_chi|settled|finished）、turn（当前行动座位）、responding_seats（响应窗口成员）、drawn_tile（仅本人刚摸的牌）、melds（四家副露 {kind,tiles}——本人吃摊数 = melds[seat] 中 kind=="chi" 的组数）、god.catch_play（抓打圈）、god.god_discarder_seat（抓打圈豁免方座位，无圈 = -1；本人受限 ⇔ catch_play && god_discarder_seat != seat）。draw 且 turn==seat 可出牌/胡/杠；窗口阶段仅 responding_seats 成员可碰/吃/明杠/pass，且 吃摊数已达 2 组时不可再吃（吃最多 2 摊，服务端 409）。窗口「已响应」状态须客户端本地跟踪——重复提交 pass/动作返回 409 INVALID_ACTION。
 
-• 弃胡机制：摸牌后不强制自动胡——客户端自行判胡（快照无 allowed_actions）后可提交 {"action":"hu"} 胡牌，也可继续打牌（飘/杠链前提：爆头态摸白板弃胡打出 = 财飘）。
+• 弃胡机制：摸牌后不强制自动胡——客户端自行判胡（快照无 allowed_actions）后可提交 {"action":"hu"} 胡牌，也可继续打牌（飘/杠链前提：爆头态摸白板弃胡打出 = 财飘）。杠后补牌同（2026-09-13 起）：tile_drawn 带 gang_replenish 时若已成胡，同样停在 phase="draw" + turn==seat + drawn_tile=补牌 等你决策——可 hu、可接着杠（链继续累计）、可弃胡打财神续飘；不提交则出牌超时自动胡。
 
 • 快照 god 字段（本人视角）：baotou（爆头状态）、chain_count（本人动作链次数：飘/杠累计，断链清零）、catch_play（抓打圈）、god_discarder_seat（抓打圈豁免方座位：打财神者本人；无圈 = -1——圈中等于本人 seat 即豁免，可吃碰明杠与任意出牌）。
 
@@ -306,7 +317,9 @@ if meta["version"] > KNOWN:
 
  | 限制 | 数值
 
- | 每用户同时参赛场数（含挂起） | ≤ 16
+ | 每用户同时在打场数（自由对战准入） | ≤ 16（判据 = 正在进行的对局数 + 房间 M ≤ 16）
+
+ | 锦标赛报名占用 | 不占额度（2026-09-14 起）——报名不建房间、不消耗服务器资源，不受 16 场上限约束，也不影响自由对战与自建测试房
 
  | state 轮询频率 | 16 次/秒（2026-09-03 从 8/s 放宽：认证缓存落地后 A/B 实测达标；旧 bot 按 8/s 自限无需改动）
 
@@ -348,7 +361,7 @@ if meta["version"] > KNOWN:
 
  | 409 | MATCH_BUSY | 自动匹配（/api/match）在途自动房达 50 上限且无半空房可入——只挡建房、不挡入席（半空房永远可入），message 明示，延时后自重试（v13 起）
 
- | 409 | MATCH_LIMIT_REACHED | 已达同时 16 场上限（register/ready 与 /api/match 同码；match 为建房前校验 + actor 兜底双位点）——释放场次后重试，不换房不空转
+ | 409 | MATCH_LIMIT_REACHED | 已达同时在打 16 场上限 ——只会来自 POST /api/match（建房前校验 + actor 兜底双位点）。判据 = 正在进行的对局数 + 房间 M ≤ 16；报名锦标赛自 2026-09-14 起不再返回本码（报名不占额度）。释放场次（打完几场）后重试，不换房不空转
 
  | 429 | RATE_LIMITED | 轮询超频 / 并发挂起超限
 
@@ -374,7 +387,7 @@ if meta["version"] > KNOWN:
 
 • 阶段确认：stage_open 时名单内（晋级者/候补）提交 POST /api/tournaments/{id}/ready 或 /me/ready = 出席确认（幂等 200；门户玩家也可用「资格确认」按钮，同语义）。名单外（海选已淘汰仍 registered、未报名者）→ 409 NOT_QUALIFIED。确认不跨阶段继承——每阶段都要重新确认（漏确认不冻结，到点按已确认且开赛时刻在线者取前 G、候补顶替——v13 新建赛事：在线 = 最近 90s 内有已认证请求，见 §2.6 附注）；非确认期提交 → 409 TOURNAMENT_STARTED。阶段 2+ 响应中 ready_users 恒 0（防泄底），确认人数不对玩家暴露。
 
-• 排名语义：ranking 条目 = user_id/total_score/place_points/god_count/games_played/rank(1..n)；running 期是当阶段实时账，stage_open/stage_done 间隙回落上一阶段结算榜；games_played 每阶段归零（当阶段按局累计——字段名沿旧：每局结束参与者 +1、轮空一场 +1），不可跨阶段累加推进度。
+• 排名语义：ranking 条目 = user_id/total_score/place_points/god_count/games_played/rank(1..n)；running 期是当阶段实时账，stage_open/stage_done 间隙回落上一阶段结算榜（同样按下方判定链排序——rank 恒为该阶段的成绩名次；组轮阶段「谁晋级」看 qualified/qualify_role，不要从名次推断）；games_played 每阶段归零（当阶段按局累计——字段名沿旧：每局结束参与者 +1、轮空一场 +1），不可跨阶段累加推进度。
 
 • 决赛加赛：决赛轮常规场次打完若 1-4 名总得分有并列 → running 态自动加赛并账循环（无上限）。新加赛场的 game_id 自动出现（含 _s{k} 阶段段标识）——持续轮询 /api/me 的 active_games（或 tournament 详情 my_games，历史累计新 ID 追加）发现并照常参赛。
 
@@ -455,8 +468,9 @@ def play(gid):
             print("本场结束，积分:", (res.get("snapshot") or {}).get("scores"))
             return
         if res.get("pending"):      # 30s 内无新事件：继续挂起
-            # 局边界例外（v10）：round_ended 后新局不发事件——seq 落后当前局时
-            # poll 立即回新局全量快照（gap:true），直接以快照为准，不会挂起
+            # 局边界例外（v10/v31）：round_ended 后新局不发事件——seq 落后当前局时
+            # poll 最多 5 秒后回新局全量快照（gap:true），直接以快照为准，不会挂起；
+            # 这 5 秒内快照是上一局终态（phase="settled"），再等一拍即得新局手牌
             continue
         snap = res.get("snapshot")
         if snap is None:            # 增量事件：推进 seq 后重拉权威快照

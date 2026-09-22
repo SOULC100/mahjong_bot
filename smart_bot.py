@@ -27,15 +27,20 @@ sys.path.insert(0, ".")
 
 from mahjong.game_state import GameState
 from mahjong.tiles import tile_from_str, tile_to_str, LAIZI_INDEX
-from mahjong.decision import should_piao, should_peng, should_chi, discard_decision, angang_tile
+from mahjong.decision import should_piao, should_peng, should_chi, discard_decision, angang_tile, \
+    should_decline_hu, piao_after_discard
 from mahjong.shanten import shanten
 from mahjong.fan import ycb_can_hu
 
 SERVER = "https://10.240.169.190:18080"
 
-# 本代码已核对的接入指南版本（GET /portal/api/guide/version，2026-09-10 = v30）
-# v30 = 他人姓名字段收口（一律昵称/空串）——bot 不用 name 字段，零影响；v29 = 全服功能开关（403 FEATURE_DISABLED）。
-KNOWN_GUIDE_VERSION = 30
+# 本代码已核对的接入指南版本（GET /portal/api/guide/version，2026-09-14 = v34）
+# v34 = 门户今日榜加 last 行（门户面，零影响）；v33 = 杠后补牌改「停弃胡决策窗口」（补牌与普通摸牌同构，
+#       须客户端自己提交 hu，超时自动胡兜底 —— 本 bot 主动判胡，零改动）；v32 = 杠爆判定修正（×2→×4，
+#       与 mahjong/fan.py 的「爆头×杠开」口径一致）；v31 = 局间固定 5s 停顿（窗口内 phase="settled"，
+#       收到 round_ended 后立刻 seq=0 会拿到上一局终态，须把 settled 当「再等一拍」）；
+# v30 = 他人姓名字段收口（零影响）；v29 = 全服功能开关（403 FEATURE_DISABLED）。
+KNOWN_GUIDE_VERSION = 34
 
 
 def _parse_args(argv):
@@ -70,7 +75,67 @@ LOG = open("data/smart_%s.log" % BOT_ID, "w", encoding="utf-8")
 # True 用二次进张(ukeire_depth，慢但更准，最坏 ~370ms/次)；False 用进张质量
 # (ukeire_quality，~1ms)。实测 10 线程并发 + GIL 下 True 单次可拖到 ~1.9s，
 # 逼近 3s 出牌窗口——先关。等提速验证有效后，用 sim_ab 对比深度对胡牌率的影响再决定。
+# 2026-09-20 复核：ukeire_depth 对听牌候选恒返回 0（ukeire.py:88-93），实测 6.9s/次
+# → 在重写之前**不要打开**（见 docs/improvement-plan.md P1-a）。
 USE_DEPTH = False
+
+# ---- 弃胡 + 财飘（2026-09-20，规则 guide §1.2；与 sim/players.Smart 共用同一判据） ----
+# 规则明确允许「摸牌后不强制自动胡」：爆头态摸到白板 → 弃胡打白飘 = 动作链 +1（×2），
+# 可连飘（×4/×8/×16）；v33 起杠后补牌同口径。EV 判据见 mahjong.decision.should_decline_hu
+# （q* = (f0+c)/(2f0+c)；闲家 f0=2 → q*=0.70 < q=0.75 → 飘；庄家 → q*=0.83 > 0.75 → 不飘）。
+DECLINE_HU = True     # False = 旧行为（能胡就胡）
+DECLINE_Q = 0.75      # 「活过一圈」存活率估计（rules-strategy §2.5 实测 0.75~0.80）
+DECLINE_MAX_CHAIN = 3  # 连飘上限
+
+# ---- 鸣牌 ukeire 门控（2026-09-21 冻结基准晋级） ----
+# 含义：向听数**不降**、但「进张质量提升」时也吃/碰（早巡加速成牌）。
+# 证据（1000 局冻结基准 + 2000 局 holdout，合并 3000 局配对，见 docs/eval-rounds.md）：
+#   both_gate  Δ分 +0.326（z=3.42）／Δ胜率 +1.27pp（z=2.47）
+#   peng_gate  Δ分 +0.191（z=3.16）／Δ胜率 +1.03pp（z=3.03）
+# ⚠️ 与旧文档「A1 吃碰 ukeire 门控 → 证伪」相反：旧测是单 seed + 硬编码阈值 + 无配对。
+# 依赖：门控用 `remain` 评估进张质量，所以必须与 sim 同口径 → 见 game_state._recalc_remain 的副露修正。
+CLAIM_UKEIRE_GATE = True    # False = 旧行为（只在向听下降时鸣牌）
+CLAIM_GATE_MAX_SHANTEN = 1  # 「等向听但质量提升」只允许前置向听 ≤ 该值（限制过早锁面子）
+
+# ---- 吃：同一张弃牌多解时，先消化「自己摸不进来」的那副搭子（2026-09-25 R15 晋级）----
+# 口径：`pair_completions` 里除去刚被打出的那张，还剩多少张未见（**张数比较在同一决策内进行
+# → 与 remain 的缩放无关，线上/sim 天然一致**）。实测（3000 局配对，pooled）：
+#   +0.265 分/局、+0.73pp 胜率（z=2.66 / 1.47），场均番 1.108→1.170，胡牌率 25.5%→26.2%
+#   （发现集 +0.392 z=2.41 → 确认集 +0.202 z=1.61，分半同号）
+# 对照（**没有**晋级）：向听 ≥3 时"干脆不吃宽搭子"（narrow_max_accept）发现集 +0.484 但确认集
+#   只剩 +0.021（选择效应）；且与本法组合后 +0.008 ⇒ 该门控会把本法能受益的吃挡掉。见 §22。
+CHI_PREFER_NARROW = True
+
+# ---- 明杠 / 补杠（2026-09-21 冻结基准给出方向：**不加门控最好**） ----
+# 量化（1000 局冻结基准，相对已晋级的 both_gate）：
+#   关掉明杠（= 线上现状）        −0.161 分 / −0.70pp 胜率（z=−1.82 / −2.11）
+#   只在杠后听牌时明杠            −0.078（z=−1.31）
+#   只在杠后向听 ≤1 时明杠        −0.046（z=−0.92）
+#   墙 ≤40 不再明杠               −0.021（z=−1.41）
+#   → 单调：门控越紧越差 ⇒ **明杠该做就做**（只受规则约束：最后 10 墩禁杠、圈内受限方禁明杠/补杠）。
+# 历史坑：明杠/补杠曾因「409 后重提」死循环被整条禁用；现配 skip_gang poison pill + 单测。
+MINGGANG = True     # 响应窗口：手里有 3 张同一弃牌 → 明杠
+BUGANG = True       # 自己回合：已碰 + 手里有第 4 张 → 补杠
+
+# ---- 坐庄策略（必须与 opt/champion.json 的 dealer_policy 一致）----
+# 冠军 genome 是 `dealer_policy="aggr"`（坐庄抢速：把爆头路线 slack/max 收紧到 0、杠子保留分清零，
+# 宝押"当庄的胜率"而不是番型/未来杠）。冻结基准实测**关掉它 = −0.272 分/局**
+# （r1，两半同为负 −0.224/−0.320；z=−1.23 未达显著，但方向在两次测量里一致）。
+# 2026-09-21 之前线上**从不传 dealer_speed** → 线上跑的比自己的冠军更保守，本轮补齐。
+DEALER_POLICY = "aggr"   # "off" = 旧行为（不抢速）
+
+# ---- YCB（有财必拷响）专用档位（2026-09-21 冻结基准 YCB 专项）----
+# 冠军 genome 是**非 YCB** 下调出来的，下面两个旋钮在 YCB 下从未标定过：
+#   ① `ycb_escape_gap`：YCB 下手持财神时，"弃最后一张财神逃回平胡"的虚向听 = 平胡向听 + gap。
+#      gap>0 ⇒ 逃回更难被选中 ⇒ 坚持追爆头（×2 起）。实测（冻结 1000 局、YCB=True）：
+#        gap=−2 / −1 → **−1.376 分/局（z=−4.78，−2.70pp 胜率）**
+#        gap=0（原线上/冠军）→ 基准
+#        **gap=+1 / +2 → +1.972 / +1.992 分/局（z≈5.9）、+4.3pp 胜率**（场均番型 1.405→1.709）
+#      → 取 +1（两档统计上等价，取更保守的一档）。非 YCB 下这个参数不参与决策（惰性）。
+#   ② `fan_override`（EV 框架：番型抵消 1 向听）：线上原来在 YCB 下**关掉**它（"未经 YCB 标定"的保守做法），
+#      实测关掉 = **−0.668 分/局（z=−3.24，−1.20pp）**；非 YCB 下关掉也只是 −0.060（噪声）。
+#      → 改为**始终开启**（原保守假设被实测推翻）。
+YCB_ESCAPE_GAP = 1       # YCB 下的逃回门限（0=旧行为）
 
 
 def log(*a):
@@ -150,16 +215,19 @@ def api(method, path, body=None, auth=True):
     raise ApiError(429, "rate limited after retries")
 
 
-def choose_discard(hand, allowed_set, remain, melds=0, youcai_bikao=False):
+def choose_discard(hand, allowed_set, remain, melds=0, youcai_bikao=False, dealer_speed=False):
     """在允许打出的牌集合内选最优出牌（复用 decision 引擎，depth 由 USE_DEPTH 控制）。
 
-    fan_override（番型抵消 1 向听的 EV 框架）：仅非 YouCaiBiKao 时开——
-    sim 同 seed A/B 复验 +0.65pp 胡牌率 / +0.25 平均分（2000 局）；YCB 下手持财神必爆头，
-    EV 框架未经该模式标定，保守关闭。
+    fan_override（番型抵消 1 向听的 EV 框架）：**始终开启**。历史注释说"YCB 下保守关闭"，
+    2026-09-21 实测推翻了它：关掉 = YCB 下 −0.668 分/局（z=−3.24）、非 YCB 下 −0.060（噪声）。
+    dealer_speed：坐庄抢速（冠军 genome 的 dealer_policy="aggr"）。
+    2026-09-21 补上 —— 线上此前从不传这个参数，等于**线上跑得比自己的冠军更保守**。
+    ycb_escape_gap：YCB 下的"逃回平胡"门限（见 YCB_ESCAPE_GAP 的实测依据）。
     """
     return discard_decision(hand, remain, melds, depth=USE_DEPTH,
-                            dealer=False, fan_override=(not youcai_bikao), allowed=allowed_set,
-                            youcai_bikao=youcai_bikao)
+                            dealer=False, fan_override=True, allowed=allowed_set,
+                            youcai_bikao=youcai_bikao, dealer_speed=dealer_speed,
+                            ycb_escape_gap=(YCB_ESCAPE_GAP if youcai_bikao else 0))
 
 
 def can_hu(hand, melds=0, youcai_bikao=False, drawn=-1, gang_kai=False):
@@ -229,12 +297,34 @@ def determine_action(snap):
     return None
 
 
+def _laizi_discardable(state, restricted):
+    """本回合能否打出财神：抓打圈受限方只能打刚摸的牌（guide v26），故只有在
+    「没被圈限制」或「刚摸的正好是财神」时才可能飘。"""
+    return (not restricted) or state.drawn_tile == LAIZI_INDEX
+
+
+def bugang_tile(hand, peng_tiles):
+    """补杠：已碰的牌里，手里还留着第 4 张的那张（返回 tile 索引，无则 None）。
+
+    hand: 我的完整手牌（draw 阶段 14 张；补杠会先把第 4 张并入副露，再摸补牌）。
+    peng_tiles: `GameState.peng_meld_tiles()`（已碰的牌索引；财神已被排除）。
+    """
+    for t in peng_tiles:
+        if t != LAIZI_INDEX and hand[t] >= 1:
+            return t
+    return None
+
+
 def choose_action(state, phase_info, melds=0, youcai_bikao=False, skip_hu=False,
-                  chi_count=None, gang_kai=False):
+                  chi_count=None, gang_kai=False, is_dealer=None, skip_piao=False,
+                  skip_gang=False):
     """根据局面和当前阶段选择动作。返回动作 dict 或 None。
 
     chi_count: 本人已有吃摊数（v25 服务端强制 ≤2；None = 解析不出，交服务端 409 兜底）。
     gang_kai: 本回合是否杠后补牌（YCB 免爆头胡法）。
+    is_dealer: 本局本人是否庄家；None = 未知（按庄家保守处理，见弃胡判据）。
+    skip_piao: 打财神被服务端 409 拒绝后置位——本手牌状态不再打财神（防重提死循环）。
+    skip_gang: 明杠/补杠被 409 拒绝后置位——本手牌状态不再提杠（防重提死循环）。
 
     None 表示「无需提交」：要么非己方动作，要么 pass（碰/吃窗口固定走满，
     不 POST 让服务器自然超时，省请求）。"""
@@ -249,6 +339,19 @@ def choose_action(state, phase_info, melds=0, youcai_bikao=False, skip_hu=False,
         # 1. 能胡就胡（仅当真的摸了牌；碰/吃/杠后 drawn_tile 为空禁止胡；误判被拒后跳过）
         if tile_str and not skip_hu and can_hu(hand, melds, youcai_bikao,
                                                state.drawn_tile, gang_kai):
+            # 1b. 弃胡打财飘（guide §1.2，2026-09-20）：只在「打白后仍爆头」且 q>q* 时才弃；
+            #     判据与 sim/players.Smart.want_hu 共用 mahjong.decision.should_decline_hu。
+            if (DECLINE_HU and not skip_piao and _laizi_discardable(state, restricted)
+                    and should_decline_hu(
+                        hand, melds, drawn=state.drawn_tile, gang_kai=gang_kai,
+                        chain_count=state.piao_count(),
+                        is_dealer=(True if is_dealer is None else bool(is_dealer)),
+                        q_est=DECLINE_Q, max_chain=DECLINE_MAX_CHAIN)):
+                log("弃胡打财飘: chain=%s is_dealer=%s 手牌=%s"
+                    % (state.piao_count(), is_dealer, hand))
+                # 必须显式打财神：discard_decision 的财飘分支只在同一形态下触发，
+                # 而七对形财飘不在 should_piao 里——交给它会有「弃了胡却打别的牌=链断」的风险。
+                return {"action": "discard", "tile": tile_to_str(LAIZI_INDEX)}
             return {"action": "hu", "tile": ""}
         # 2. 抓打圈受限方：只能打刚摸的牌（跳过杠/财飘/择优）；豁免方不受此限
         if restricted:
@@ -258,18 +361,27 @@ def choose_action(state, phase_info, melds=0, youcai_bikao=False, skip_hu=False,
         # 3. 暗杠：听牌才杠 + 墙剩>20（angang_tile 已含七对/豪华七对保护），杠开 ×2 × 庄家×8。
         #    只在真摸牌回合评估（tile_str 有值），碰/吃后待弃回合不杠。
         #    抓打圈内「其余玩家」也允许暗杠（规则：圈内仅禁吃/碰/明杠），故不设圈门禁。
-        #    只做暗杠：明杠需响应他人弃牌窗口、补杠需解析 melds 里的杠/碰类型，
-        #    两者历史上都触发过牌数/死循环，暂缓（留待实房验证）。
-        if tile_str and state.wall_remaining > 20:
+        if tile_str and state.wall_remaining > 20 and not skip_gang:
             gt = angang_tile(hand, state.drawn_tile, melds)
             if gt is not None:
                 return {"action": "gang", "tile": tile_to_str(gt)}
+            # 3b. 补杠（已碰 + 手里第 4 张）：墙剩>20（最后 10 墩禁杠）；
+            #     抓打圈受限方在上面第 2 步就 return 了 → 这里天然只有豁免方/无圈才走到。
+            if BUGANG:
+                bt = bugang_tile(hand, state.peng_meld_tiles())
+                if bt is not None:
+                    log("补杠: 已碰 %s 且手里第 4 张" % tile_to_str(bt))
+                    return {"action": "gang", "tile": tile_to_str(bt)}
         # 4. 财飘
         if should_piao(hand):
             return {"action": "discard", "tile": tile_to_str(LAIZI_INDEX)}
         # 5. 出牌
         allowed_set = set(t for t in range(34) if hand[t] > 0)
-        d = choose_discard(hand, allowed_set, state.remain, melds, youcai_bikao)
+        if skip_piao:
+            allowed_set.discard(LAIZI_INDEX)  # 打财神被拒过 → 本手牌状态不再打白
+        dealer_speed = (DEALER_POLICY == "aggr" and is_dealer is True)  # 坐庄抢速（冠军口径）
+        d = choose_discard(hand, allowed_set, state.remain, melds, youcai_bikao,
+                           dealer_speed=dealer_speed)
         return {"action": "discard", "tile": tile_to_str(d)}
 
     if phase == "peng":
@@ -277,7 +389,14 @@ def choose_action(state, phase_info, melds=0, youcai_bikao=False, skip_hu=False,
         hand13 = state.full_hand()  # 13 张（响应他人弃牌，无 drawn）
         if restricted:
             return None  # 抓打圈受限方不能碰/明杠（打财神者本人豁免）
-        if should_peng(hand13, t, melds):
+        # 明杠优先于碰（与 sim/engine 的优先级一致：明杠 > 碰 > 吃）。
+        # 规则：财神不能被杠 → t != LAIZI；最后 10 墩禁杠 → wall > 20。
+        if (MINGGANG and not skip_gang and t != LAIZI_INDEX and hand13[t] >= 3
+                and state.wall_remaining > 20):
+            log("明杠: 手里 3 张 %s" % tile_str)
+            return {"action": "gang", "tile": tile_str}
+        if should_peng(hand13, t, melds, ukeire_gate=CLAIM_UKEIRE_GATE,
+                       remain=state.remain, gate_max_shanten=CLAIM_GATE_MAX_SHANTEN):
             return {"action": "peng", "tile": tile_str}
         return None
 
@@ -288,7 +407,8 @@ def choose_action(state, phase_info, melds=0, youcai_bikao=False, skip_hu=False,
             return None  # 抓打圈受限方不能吃（打财神者本人豁免）
         if chi_count is not None and chi_count >= 2:
             return None  # v25：吃最多 2 摊（服务端 409 强制，本地先自限）
-        if should_chi(hand13, t, melds):
+        if should_chi(hand13, t, melds, ukeire_gate=CLAIM_UKEIRE_GATE,
+                      remain=state.remain, prefer_narrow=CHI_PREFER_NARROW):
             return {"action": "chi", "tile": tile_str}
         return None
 
@@ -322,12 +442,21 @@ def play(gid, state, youcai_bikao=False):
     chi_count = None  # 我的吃摊数（v25 ≤2）——快照 melds[seat] 中 kind=="chi"
     responded_key = None  # 当前响应窗口 key，已响应则不再重复提交
     skip_hu = False  # hu 误判被拒后，本次手牌状态跳过 hu
+    skip_piao = False  # 打财神被 409 拒后，本次手牌状态不再打财神（防重提死循环）
+    skip_gang = False  # 明杠/补杠被 409 拒后，本次手牌状态不再提杠（防重提死循环）
     last_drawn = None
     # 杠开窗口（YCB 免爆头胡法）：杠提交成功即armed，本次摸牌回合内有效；
     # 一旦提交别的动作（出牌/碰/吃）即解除。不用「drawn 变化」判——杠后补牌可能与杠前
     # 那张同值（例如手里 4×5w、摸 3t 杠 5w 后又摸到 3t），按牌面比较会漏判。
     gang_kai_armed = False
+    settled_round = "?"  # v31：局间 5s 停顿只在每局记一次日志
     drift_streak = 0  # 连续守恒校验失败计数，防死循环
+    # 庄家跟踪（2026-09-20）：首局 = seat 0，之后 = 上局赢家（庄赢/流局连庄）——真机实测口径。
+    # 只在「本局是否庄家」这一点上被使用（弃胡判据的 q* 与将来的 dealer_policy）；
+    # 万一漏掉 round_ended 事件 → 标 None（未知）并按庄家保守处理，宁可不飘也不误飘。
+    cur_dealer = 0
+    round_seen = None
+    round_ended_seen = False
     while True:
         try:
             res = api("GET", "/api/games/%s/state?seq=%d" % (gid, seq))
@@ -352,6 +481,13 @@ def play(gid, state, youcai_bikao=False):
             events = res.get("events") or []
             for ev in events:
                 seq = ev.get("seq", seq)
+                if ev.get("type") == "round_ended":  # v19+：data 含 dealer/round_no/scores
+                    d_ev = ev.get("data") or {}
+                    if d_ev.get("draw"):
+                        cur_dealer = d_ev.get("dealer", cur_dealer)  # 流局 → 庄家连庄
+                    elif ev.get("seat", -1) >= 0:
+                        cur_dealer = ev["seat"]                      # 赢家 → 下局坐庄
+                    round_ended_seen = True
             if not _needs_snapshot(events, my_seat):
                 continue
             res0 = api("GET", "/api/games/%s/state?seq=0" % gid)
@@ -361,6 +497,14 @@ def play(gid, state, youcai_bikao=False):
             seq = res.get("seq", seq)
         if snap is None:
             continue
+        # 新一局：若上一局没看到 round_ended（事件被快照吞掉等）→ 庄家未知，按庄家保守处理
+        rn = snap.get("round_no")
+        if rn != round_seen:
+            if round_seen is not None and not round_ended_seen:
+                cur_dealer = None
+                log("⚠️ 未观测到上局 round_ended → 本局庄家未知（弃胡等庄家敏感策略按庄家保守处理）")
+            round_seen = rn
+            round_ended_seen = False
         if my_seat < 0:
             my_seat = snap.get("seat", -1)
         state.update_from_snapshot(snap)
@@ -385,11 +529,23 @@ def play(gid, state, youcai_bikao=False):
             log("连续漂移，放弃校验继续")
         else:
             drift_streak = 0
+        # v31（2026-09-11）：每局结算到下一局发牌之间固定停 5 秒，窗口内 phase="settled"、
+        # round_no 仍是刚结束那一局、手牌是上一局终态。此时不动作：把 settled 当「再等一拍」，
+        # 继续用当前 seq 轮询（服务端在发牌那一刻唤醒挂起轮询，v10 的跨局承诺仍成立）。
+        if snap.get("phase") == "settled":
+            rn = snap.get("round_no")
+            if rn != settled_round:
+                settled_round = rn
+                log("phase=settled（局间 5s 停顿）round_no=%s，等待下一局" % rn)
+            gang_kai_armed = False  # 局间不保留杠开窗口，避免跨局误判杠开
+            continue
         # 新摸牌（drawn_tile 变化）则重置 hu 拦截
         drawn = snap.get("drawn_tile", "")
         if drawn != last_drawn:
             last_drawn = drawn
             skip_hu = False
+            skip_piao = False
+            skip_gang = False
         gang_kai = gang_kai_armed  # 杠开窗口见上方说明
         phase_info = determine_action(snap)
         if phase_info is None:
@@ -401,7 +557,9 @@ def play(gid, state, youcai_bikao=False):
             if key == responded_key:
                 continue
         act = choose_action(state, phase_info, melds, youcai_bikao, skip_hu,
-                            chi_count, gang_kai)
+                            chi_count, gang_kai,
+                            is_dealer=(state.my_seat == cur_dealer) if cur_dealer is not None else None,
+                            skip_piao=skip_piao, skip_gang=skip_gang)
         if act is None:
             continue  # pass 或无需动作：不 POST，窗口自然走满
         log("提交:", json.dumps(act, ensure_ascii=False),
@@ -427,6 +585,13 @@ def play(gid, state, youcai_bikao=False):
                 skip_hu = True  # 误判能胡被拒，本次手牌回退出牌
             if act["action"] == "gang":
                 gang_kai_armed = False  # 杠被拒 → 没有杠后补牌
+                skip_gang = True        # 且本次手牌状态不再提杠（否则会重提同一动作 → 死循环）
+                log("提杠被拒 → 本手牌状态关闭提杠")
+            if act["action"] == "discard" and act.get("tile") == tile_to_str(LAIZI_INDEX):
+                # 打财神被拒（老服务端不认飘 / 圈判定差异）→ 本次手牌状态关闭财飘，
+                # 否则下一轮会重新推导出同一个动作 → 重提死循环（历史踩过，见 docs/debug_log.md）
+                skip_piao = True
+                log("打财神被拒 → 本手牌状态关闭财飘")
             log("409 拒绝:", code, json.dumps(act, ensure_ascii=False), e.body[:150])
         seq = 0
 
@@ -444,7 +609,8 @@ def _play_safe(gid, state, youcai_bikao):
 def check_guide_version():
     """启动版本自检（指南 §2.2，免认证）：服务器指南版本高于本代码已知版本时告警并列出新 breaking。
 
-    2026-09 就吃过这个亏：本仓库文档快照停在 v11，服务器实际已到 v29。
+    2026-09 就吃过这个亏：本仓库文档快照停在 v11，服务器实际已到 v29（同一天又发了 v30——
+    正是本自检在真机联调时立刻报出来的）。
     """
     try:
         meta = api("GET", "/portal/api/guide/version", auth=False)

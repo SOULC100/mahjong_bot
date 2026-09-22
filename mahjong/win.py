@@ -6,7 +6,7 @@
 财神（白板）可替代任意牌。
 """
 
-from .tiles import NUM_TILES, LAIZI_INDEX, is_number
+from .tiles import NUM_TILES, LAIZI_INDEX, is_number, run_starts
 
 
 def split_laizi(counts):
@@ -83,23 +83,23 @@ def _can_meld(tiles, laizi) -> bool:
             return True
         tiles[i] += use
 
-    # 顺子：i 为数牌且不超过 7（i%9 <= 6），用 i,i+1,i+2，缺的用财神补
-    if is_number(i) and i % 9 <= 6:
-        present = []
+    # 顺子：缺的用财神补。s 遍历所有包含 i 的起点——s 可低于 i（**财神补下沿**：
+    # 8筒9筒 + 财神 = 789筒），旧版只试 s=i，会把这类胡牌判成不能胡。
+    for s in run_starts(i):
         miss = 0
+        present = []
         for k in range(3):
-            if tiles[i + k] > 0:
-                present.append(i + k)
+            if tiles[s + k] > 0:
+                present.append(s + k)
             else:
                 miss += 1
         if miss <= laizi:
             for k in present:
                 tiles[k] -= 1
-            if _can_meld(tiles, laizi - miss):
-                for k in present:
-                    tiles[k] += 1
-                return True
+            ok = _can_meld(tiles, laizi - miss)
             for k in present:
                 tiles[k] += 1
+            if ok:
+                return True
 
     return False
