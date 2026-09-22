@@ -15,12 +15,30 @@ from functools import lru_cache
 from .tiles import NUM_TILES, LAIZI_INDEX, is_number, run_starts
 from .win import split_laizi, can_win
 
+# ---- 记忆化缓存的上界（P0-4，2026-09-25）----
+# 旧实现是 `lru_cache(maxsize=None)`：实测**仅 20 局**就攒到 _mp 5,216,492 条 / _best 179,507 条；
+# 之后内存压力会把单次决策拖到几十秒（子 agent 在 sim 里观测到单次 45.5 s；线上 10 进程探针曾到 38 GB）。
+# 线上出牌窗口只有 3 s ⇒ 这是"尾部丢局"级别的可用性风险，务必设上界。
+# 实测（20 局同强度自博）：无界 29.9s / 1M 31.3s / 500k 33.7s / 200k 35.0s —— 取 500k：
+# 正好覆盖"一局的新增状态量"（≈26 万条），线上再叠加每局 clear_caches() → 内存封顶且不损速度。
+CACHE_MAXSIZE = 500_000
+
+
+def clear_caches():
+    """清空向听缓存（线上每局调用一次，保证长赛程内存不涨）。缓存只影响速度，不影响结果。"""
+    _best.cache_clear()
+    _mp.cache_clear()
+
 
 def shanten(counts, melds=0) -> int:
     """返回标准向听数（14 张已胡 = -1，13 张听牌 = 0）。
 
     melds: 已副露的面子数（碰/吃/杠各记 1 个面子），默认为 0。
     """
+    if min(counts) < 0:
+        # 防御：负计数（局面漂移/调用方多扣了牌）会让 _mp 的「最低非零牌」永远消不掉 →
+        # 无限递归 → 线上 3s 出牌窗口直接崩。夹到 0 后按"缺牌"处理，宁可算错也不崩。
+        counts = [c if c > 0 else 0 for c in counts]
     tiles, laizi = split_laizi(counts)
     groups = 4 - melds
     standard = 8 - 2 * melds - _best(tuple(tiles), laizi, groups)
@@ -51,7 +69,7 @@ def _shanten_seven_pairs(tiles, laizi) -> int:
     return 6 - formed
 
 
-@lru_cache(maxsize=None)
+@lru_cache(maxsize=CACHE_MAXSIZE)
 def _best(tiles, laizi, groups) -> int:
     """2*面子 + 搭子 + 将牌 的最大值。
 
@@ -70,7 +88,7 @@ def _best(tiles, laizi, groups) -> int:
     return best
 
 
-@lru_cache(maxsize=None)
+@lru_cache(maxsize=CACHE_MAXSIZE)
 def _mp(tiles, laizi, groups) -> int:
     """2*面子 + 搭子 的最大值（不含将），最多再组 `groups` 组。"""
     i = 0

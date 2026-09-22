@@ -25,7 +25,8 @@ def check(name, got, expected):
 
 def main():
     results = []
-    # 牌索引：0-8万 9-17筒 18-26条 27东 28南 29西 30北 31中 32发 33白
+    # 牌索引：0-8万 9-17**条**(协议 t) 18-26**筒**(协议 b) 27东 28南 29西 30北 31中 32发 33白
+    # （平台口径 w=万/t=条/b=筒，见 mahjong/tiles.py 文件头与 tests/test_tile_coding.py）
 
     # 1. 吃 5万(4)：手牌有 3/4/6/7万，应枚举 3 种顺子位置
     hand = [0] * 34
@@ -59,9 +60,9 @@ def main():
     hand5[3] = 1               # 4万
     hand5[4] = 1               # 5万
     hand5[8] = 1               # 9万（浮牌）
-    hand5[9] = 3               # 111筒
-    hand5[19] = 1              # 2条
-    hand5[20] = 1              # 3条
+    hand5[9] = 3               # 111条（协议 1t）
+    hand5[19] = 1              # 2筒（协议 2b）
+    hand5[20] = 1              # 3筒（协议 3b）
     hand5[27] = 2              # 东东
     s_before = shanten(hand5, 0)
     results.append(check("示例手牌向听=1", s_before, 1))
@@ -74,7 +75,7 @@ def main():
         hand6[t] = 1
     hand6[0] = 3               # 111万（改成刻子，无可吃的搭子）
     hand6[8] = 1               # 9万
-    hand6[9] = 3               # 111筒
+    hand6[9] = 3               # 111条（协议 1t）
     hand6[19] = 1
     hand6[20] = 1
     hand6[27] = 2
@@ -88,8 +89,8 @@ def main():
     h7 = [0] * 34
     for t in (3, 4, 6, 7):      # 4万 5万 7万 8万
         h7[t] = 1
-    h7[9] = 3                   # 1筒刻子
-    h7[18] = 3                  # 1条刻子
+    h7[9] = 3                   # 111条刻子（协议 1t）
+    h7[18] = 3                  # 111筒刻子（协议 1b）
     remain_live = [4] * 34
     remain_live[5] = 0          # 刚被打出的 6万 已不在池中
     plain = best_chi(h7, 5, 0, ukeire_gate=True, remain=remain_live)
@@ -129,8 +130,8 @@ def main():
     h8 = [0] * 34
     for t in (0, 1, 3, 4):      # 1万 2万 4万 5万
         h8[t] = 1
-    h8[9] = 2                   # 1筒1筒
-    h8[18] = 2                  # 1条1条
+    h8[9] = 2                   # 1条1条（协议 1t）
+    h8[18] = 2                  # 1筒1筒（协议 1b）
     h8[27] = 2                  # 东东
     s8 = shanten(h8, 0)
     r8 = [4] * 34

@@ -28,6 +28,9 @@
   "decline_q": 0.75,
   "decline_max_chain": 3,
   "chi_prefer_narrow": true,
+  "gang_tenpai_only": true,
+  "gang_draw_wall": 28,
+  "defend_dealer": true,
   "shanten_cost": 100.0,
   "ukeire_w": 0.1,
   "fan_weight": 5.0

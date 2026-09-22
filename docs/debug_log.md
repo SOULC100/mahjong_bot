@@ -284,3 +284,196 @@ v17/v20/v22/v23/v27/v28（门户-only）。
 - 累计 4 轮 42 局：41 胡 1 流局、番型对拍 41/41 一致、违规 0。
 
 
+## 十二、v34 规则复核（2026-09-22）：零漂移，但抓出一处线上/离线口径缺口
+
+### 版本核对：服务器仍 = v34，本地基准未过期
+
+| 项 | 结果 |
+|----|------|
+| `GET /portal/api/guide/version` | `version=34`、`updated_at=2026-09-14`（与 `smart_bot.KNOWN_GUIDE_VERSION=34` 一致） |
+| 正文比对 | `GET /portal/api/guide?format=text` 返回的是 **JSON**（正文在 `content` 字段、`\n` 已转义）；解出 540 行与 `docs/guide-v34.txt` 去文件头后 **unified diff = 0 行** |
+| 变更日志 | 线上 58 条 vs `data/guide_version_changes.txt` 归档 58 条：**双向无差集**，detail 全量可对 |
+| 功能开关 | `GET /portal/api/features` → `{match_enabled:true, replay_enabled:true, substitute_enabled:true, test_rooms_enabled:true}`（承 §十一 6：后两个键指南无对应端点 = 门户侧开关） |
+
+**结论：v29–v34 无需适配改动。** 逐条落点：v31 `phase=settled` → `smart_bot.py:584`；
+v29 `403 FEATURE_DISABLED` → `smart_bot.py:727` + `features` 预检 `:688`；v26 `god_discarder_seat` →
+`mahjong/game_state.py:121`；v25 吃摊 ≤2 → `game_state.py:137` + `smart_bot.py:454`；
+v24 `PORTAL_BINDING_REQUIRED`/`TOKEN_NOT_SCOPED` → `smart_bot.py:730/733`；v15 `M=10/Rounds=8` 下限 → `:710`；
+v13 自动房唯一入口 `/api/match` → `:773-776`。
+
+现场错误码复核（只读探测，无副作用）：`POST /api/match` 带参赛令牌 → `400 TOKEN_NOT_SCOPED`、
+不带令牌 → `401 UNAUTHORIZED`（与代码判型一致）；`features.match_enabled=true`（自由对战当前可用）。
+
+### 缺口：线上吃牌没发 `tiles`，R15「先消化窄搭子」兑不了现
+
+- 契约：`POST /api/games/{id}/action` **自 v2 起**支持 `{"action":"chi","tile":"3w","tiles":["1w","2w"]}`
+  指定用哪两张手牌吃；**缺省服务端取「第一组可行顺子」**（guide §2.1）。
+- 事实：`sim/engine.py:213-215` 吃的是 `strategies[p].want_chi(...)` **返回的那副搭子**；
+  而 `smart_bot.choose_action` 此前只调 `should_chi`（丢弃搭子）并提交 `{"action":"chi","tile":…}`。
+- 后果：`CHI_PREFER_NARROW`（R15，3000 局配对 **+0.265 分/局、+0.73pp 胜率**）在线上只作用于「吃不吃」，
+  真正被消耗的搭子由服务端挑 ⇒ **离线收益兑不了现，且线上/离线状态不同源**（离线评估搭子 A、线上执行搭子 B）。
+  同一处的 `accept_remain` 类**绝对张数**判据（`narrow_max_accept`）同理只在离线成立。
+- 修复（2026-09-22）：chi 分支改用 `best_chi(...)` 取搭子，动作体带
+  `tiles=[tile_to_str(pair[0]), tile_to_str(pair[1])]`；`should_chi` 导入随之移除（不再有人用它）。
+- 测试：`tests/test_smart_bot.py` 新增「吃发的 `tiles` ≡ `best_chi` 的返回」（多解用例，本例 3 组搭子），
+  门禁类用例改 patch `best_chi`；**11 个测试文件全量重跑 0 失败**。
+
+### 真机验证（2026-09-22，同日完成）
+
+用门户签发的全局令牌入席自由对战（`POST /api/match`，空 body → 服务默认 `M=10/Rounds=8`、`kind=auto`、
+`YouCaiBiKao=false`），跑完整场 **room `a_5b83c31e82d3`：10 场并发 × 每场 8 局 = 80 局**。
+
+| 指标 | 结果 |
+|------|------|
+| bot 进程 | exit=0，`终止: finished`；日志 **0 Traceback / 0 `429` / 0 `张数守恒异常`** |
+| **chi `tiles` 对拍** | 日志 chi 提交 39 次（3 次被 `409 INVALID_ACTION: chi only in chi window` 拒，属窗口竞态）→ 期望落子 36 副；事件流命中 **36/36**，两侧多重集**零差异** → 服务端吃的就是 `best_chi` 选中的那副 |
+| 吃摊 ≤2（v25） | 按**每局**统计全部合规（36 副吃分布在各场） |
+| 出牌窗口超时 | **3 次**（≈1100 次出牌 → 0.27%）；响应窗口走满 2627 次（`response/peng` 1998 + `response/chi` 629，属设计内「不要就不响应」） |
+| v31 局间停顿 | 日志多次出现 `phase=settled（局间 5s 停顿）`，等待后正常接下一局 |
+| 赛果 | 80 局我胡 19 局（番型 17×平胡 + 1×杠开 + 1×爆头）、10 场净分 −49（零和：各场四家和恒 0 ✓） |
+
+**方法（可复现）**：`match_session.py --archive <room>`（归档 + 对拍一体；早期的一次性探针
+`data/_join_match.py` / `_run_match_bot.py` / `_verify_match.py` 已被它取代并删除）。
+chi 对拍有两种口径要分清：**日志的 `tiles` 只有两张手牌，事件流 `data.tiles` 已含弃牌共三张**
+（第一版脚本漏了这点，把 3 张算成 4 张，报了一堆假不一致）。
+免认证数据端点 per-room 限速 5/s，取事件流按 0.25s 间隔 + 429 退避。
+
+### 仍未做
+
+- 出牌超时 3 次是否可再压（当前自限 13.3/s 是 M=10 下的极限档，见 `set_poll_interval_for_m`）。
+- 旧轮取证限制（免认证数据端点按 `batch` 只回当前轮）仍在，见 README 待办。
+
+
+## 十三、自由对战「每场留档」流水线（2026-09-22）
+
+需求：每一次自由匹配的**对局信息、日志、赛后统计**都要留下并可跨场汇总。
+
+新增（仓库根目录，进版本库）：
+
+| 文件 | 作用 |
+|------|------|
+| `match_session.py` | 一场到底：入席 → 起 bot → **紧跟退出立刻归档事件流** → 统计 → 追加索引。支持 `--sessions N`、`--join-only`、`--archive ROOM`（补档） |
+| `match_stats.py` | 跨场汇总（净分/胡牌率/番型/超时/chi 对拍/健康），可 `--json` / `--csv` |
+| `smart_bot.py` | 令牌新增 `@文件` 形式（`python smart_bot.py @data/global_token.txt gm`）→ **明文不进 argv / 进程列表 / shell history** |
+
+产物：`data/matches/<room_id>/{session.json, bot.log, bot.stdout.log, games.json, events/b*.json,
+stats.json, stats.md}` + `data/matches/index.tsv`（一行一场）。`data/` 已被 gitignore，故留档在本地、
+不进版本库；`session.json` 只存令牌 **sha256 前 8 位指纹**，不存明文。
+
+三个已内建的坑：
+1. **60s 关停窗口**：auto 房 finished 后约 60s 关停，玩家 API 与免认证数据端点都会 404 → 归档紧跟 bot 退出执行（实测两场都在窗口内取全 10 场事件流）。
+2. **per-room 限速 5/s**：取 10 场事件流按 0.25s 间隔 + 429 退避。
+3. **补档兜底**：房间已关时拿不到 `/api/tournaments/{room}` 的 config → 房规从**日志的匹配行**恢复、时长与对局时间从**事件流 ts** 恢复。
+
+实测（同一天两场，均 M=10 × 8 局）：
+
+| room | 起打 | 我胡 | 净分 | 场均番 | 出牌超时 | chi 对拍 | 索引里的退出码 |
+|------|------|------|------|--------|----------|----------|----------------|
+| `a_5b83c31e82d3` | 16:08 | 19/80（23.8%） | −49 | 1.105 | 3/704（0.4%） | ✅ 36/36 | 补档（无） |
+| `a_86091a604d7b` | 16:32 | 21/80（26.2%） | −31 | 1.143 | 5/704（0.7%） | ✅ 44/44 | 0 |
+
+两场累计：160 局、我胡 40（25.0%）、净分 −80、出牌超时 8/1408（0.6%）、吃摊越限 0、进程异常 0、
+零和校验全通过、chi 对拍 2/2 场一致。第二场是**全自动路径**（`python match_session.py` 一条命令跑完
+入席→15.3 分钟对局→自动归档），第一场是补档路径，两条都验证过。
+
+
+## 十四、牌编码口径纠错（2026-09-22）：**t=条、b=筒**，此前注释写反了
+
+**触发**：用户复盘 room `a_5b83c31e82d3` / `a_…_b0_t0` 第 3 局时问「为什么先打二万、六万，不打九条」，
+我按本仓注释把 `9t` 说成「九筒」，并回复「你大概看串了花色」——**是我错了**。
+
+**定案证据（服务端门户自己的渲染代码，不是本仓推断）**：抓 `GET /portal/tiles.js`：
+
+| 证据 | 内容 | 结论 |
+|------|------|------|
+| `tileSVG()` | `suit === "b"` → `<circle>`（圆点）；否则 → `<rect rx="1.3">`（竹条）；`suit === "w"` → 「萬」字 | **b = 筒（圆点）**，t = 条（竹条） |
+| `TILE_RECT` 贴图取片 | `"1b": [0, 0, …]` 在底图**行0**；`"1t": [0, 305, …]` 在**行2**；注释「行0=筒 行1=万 行2=条」 | 同上 |
+| 门户番型计算器分组 | `FC_ALL_TILES` 按 `["w","b","t"]` 生成，`slice(9,18)` 标「筒子」、`slice(18,27)` 标「条子」 | 同上 |
+
+**即 `9t` = 九条、`9b` = 九筒**（本仓索引 9~17 = 协议 t = 条，18~26 = 协议 b = 筒）。
+
+**影响面**：
+- **判据/线上行为零影响**：本规则番型与花色无关，索引顺序是内部约定，协议串收发两端一致
+  （我们发 `9t`，服务端就当九条处理，一直如此）。
+- **只是面向人的文字会错**：`tiles.py` 的注释/`_TILE_NAMES`、README 牌编码表、几处测试注释、
+  以及 `strategy-current.md`/`improvement-plan.md` 的算例标签（都是 `tile_name()` 的产物）。
+- 之前几轮复盘里「留 2w 换 8 张万子、丢 10 张**筒子**」应读作「丢 10 张**条子**（7t/8t/9t）」；
+  数字与结论不变，只是花色名反了。
+
+**改动**：
+1. `mahjong/tiles.py`：文件头写清平台口径 + 三条证据；`_TILE_NAMES` 改为 万/条/筒 顺序；
+   `SUIT_PIN/SUIT_SOU` 注释标注「名字是日式术语，别按名字推花色」。
+2. 新增 `tests/test_tile_coding.py`：把「协议字母 ↔ 花色名」逐张钉死（含全 34 张自洽扫描）。
+3. 修正 `tests/test_chi.py`、`tests/test_win.py`、`tests/test_smart_bot.py` 的牌名注释，
+   `docs/README.md` 牌编码表 + 口径警示，`docs/strategy-current.md` / `docs/improvement-plan.md`
+   算例标签，`discard_ledger.py` / `data/_discard_trace.py` 的花色标签。
+4. 全量测试重跑 **12 个文件 0 失败**（新增的 test_tile_coding 全绿）。
+
+**教训**：协议字母是拼音/英文混编（w=wan、t=?、b=?），**只有服务端的渲染代码是权威**；
+本仓任何「字母↔花色」的断言都必须引 service 侧证据，别靠注释传抄（这次就是注释抄错、影响了好几份复盘文字）。
+
+
+## 十五、工作区清理（2026-09-22）：891 文件 → 714，data/ 目录 40 → 17
+
+**做法**：不凭感觉删，先做**引用扫描**再动手 ——
+`data/_cleanup_audit.py`（缓存/重复/孤儿脚本）、`data/_cleanup_audit2.py`（data/ 每个文件的被引用情况）、
+`data/_cleanup_apply.py`（按规则搬移 + 记台账，支持 `--dry-run`）、`data/_cleanup_verify.py`（清理后校验）。
+
+**规则**：
+- **硬删**：`__pycache__/`、0 字节文件、与归档**逐字节相同**的临时副本（删前做 sha256 相等断言）。
+- **搬移**（不删）到 `_attic/cleanup-2026-09-22/`，保留相对路径 + `MANIFEST.tsv`：仓库内无任何引用的脚本/产物。
+- **一律不动**：`data/eval/**`（冻结基准与全部实验证据）、`data/matches/**`（自由对战归档）、docs/code/tests/opt、
+  以及**被引用的**任何文件；另有显式保留清单（见 `_cleanup_apply.py` 头部）。
+
+**结果**：工作区 891 → **714 文件、24.60 → 18.43 MB**；`data/` 子目录 40 → **17**；
+回收站 122 文件 / 4.09 MB（`Remove-Item -Recurse _attic` 即可清空，恢复=按原路径复制回去）。
+移出的主要是：7 个老 test 房事件流抓取目录（`fetch_t_*` / `_smoke_fetch_t_*` / `prev_room_*`）、
+一次性探针脚本与它们的输出（`_probe_*.txt`、`_route_*`、`_ev_*`、`_wait_opp_*.json` 等）、
+遗留根脚本 `monitor_live.py` + `sim_ab_{a1,b,b4,d1}.py`（git 有历史，`git checkout HEAD -- <name>` 可秒恢复）。
+
+**dry-run 抓到的三类误伤（已还原）**：① `data/smart_0..3.log` 是 `_live100_report.py --logs` 的**默认输入**，
+不是垃圾；② `data/guide_live_text.txt` 是 `_gen_guide_doc.py` 的读写目标；③ `data/_wait_probe.py` 被
+`_wait_opportunity.py` 的文档串点名。→ 教训：**"没有引用"必须用工具扫，不能靠印象；扫完还要看引用的方向**
+（文件被 tracked 脚本当输入 vs 被写成输出）。
+
+**校验**：81 条「文档/代码提到的 `data/…` 路径」全部存在（3 条已知遗留见 `_cleanup_verify.py` 的
+`KNOWN_STALE`：§十二 刻意记录已删的 `_join_match.py`、从未有内容的 0 字节 `_verify_report.txt`、
+从未创建的 `data/eval/field_baseline.json`）；7 个关键入口（match_session / match_stats / eval_run /
+eval_report / explain_round / why_discard / discard_ledger）全部 OK；12 个测试文件 0 失败。
+`.gitignore` 新增 `_attic/`。**用户确认后回收站已彻底删除（129 文件 / 4.10 MB）**。
+
+
+## 十六、真机测试房回归（2026-09-22 晚）：清完文件后确认线上没坏
+
+**动机**：刚做完 §十二~§十五 一堆改动与清理，去真机测试房跑一遍确认没有回归。
+
+**入场**（两条认证路只通了一条）：
+- ❌ 无浏览器路（`data/_portal_login.py` → Auth Token API）：**`403 {"code":20001,"msg":"auth key not exists in db, it is likely expired"}`**
+  —— 本地存的 personal auth key 已过期，需重新签发才能恢复这条路。
+- ✅ 浏览器路（`create_room.py` → Playwright + 账号密码）：**需放开沙箱**（Playwright 与浏览器之间走命名管道，
+  受限模式直接 `transport connect` 失败）→ 一次 `danger-full-access` 重试后成功。
+
+**结果**：房 `t_0dedb816880e`（M=4 / 每场 3 局 / YCB=false / kind=test）
+
+| 项 | 结果 |
+|----|------|
+| 4 bot 进程 | 全部 **exit=0**；`register/ready` 的 409 是开赛后预期（代码按设计吞掉） |
+| 日志扫描 | Traceback 0、线程异常 0、`action 错误` 0、429 0、`张数守恒异常` 0 |
+| 对局 | 4 场 × 3 局 = **12 局全部有人胡**（1 把杠开），`verify_live.py` **违规计数：无** |
+| 番型对拍 | `calc_fan` vs 服务器 fan **12/12 OK**；免认证 `fan-calc` 端点 vs 服务器 **12/12 OK** |
+| **chi `tiles` 对拍**（新增脚本 `data/_smoke_chi_parity.py`） | 4 个 bot 的 chi 提交 7+12+5+10 = **34 副，日志与事件流逐副一致 ✅**；单局单人 chi 上限 = 2（v25 合规） |
+| 唯一异常 | bot1 有 **1 次 `409 INVALID_ACTION: cannot discard in phase 2`** —— 相位竞态（按旧快照出牌，服务端已推进），代码按 `seq=0` 重拉快照自愈，无后续影响；频率 1/12 局 |
+
+**两条注意事项（写给自己）**：
+1. `live_smoke.py` 直接让 bot 写 `data/smart_<i>.log`（`"w"` 覆盖）→ **每次烟测都会覆盖上一轮的同名日志**。
+   本次已把 4 份日志复制进归档 `data/_smoke_fetch_<room>_<ts>/logs/bot<i>.log`（含 `_smoke_report.txt`
+   与 `_verify_report.txt`）；§十五 里从回收站还原的 R13 原始日志因此被本轮覆盖（R13 的结论与报告
+   `data/_live100_report.md` 仍在，但**原始日志没了**）——以后要留就先复制。
+2. `verify_live.py` 的结果**写文件不打印**：`data/_verify_report.txt`（`print(..., file=OUT)`），
+   命令行静默是正常的，别当成失败。
+
+
+
+
+
+

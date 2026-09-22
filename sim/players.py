@@ -11,10 +11,11 @@
 """
 
 from mahjong.tiles import NUM_TILES, LAIZI_INDEX
+from mahjong.shanten import shanten
 from mahjong.decision import discard_decision, should_peng, best_chi, angang_tile, \
     should_decline_hu, SHANTEN_COST as _SC, UKEIRE_W as _UW, FAN_W as _FW
 
-from sim.engine import ANGANG, BUGANG, CHI, PENG
+from sim.engine import ANGANG, BUGANG, CHI, MINGGANG, PENG
 from sim.infer import infer_remain
 
 
@@ -73,8 +74,10 @@ class Smart(Strategy):
                  minggang_max_shanten=None, minggang_min_wall=None,
                  chi_gate_max_shanten=None, allow_laizi_discard=False, wait_full_max_wall=None,
                  chi_budget=None, chi_last_strict=False,
+                 gang_tenpai_only=False, gang_draw_wall=None,
                  chi_narrow_max_accept=None, chi_narrow_min_shanten=None, chi_prefer_narrow=False,
-                 shanten_cost=_SC, ukeire_w=_UW, fan_weight=_FW, god_fan_boost=1.0):
+                 shanten_cost=_SC, ukeire_w=_UW, fan_weight=_FW, god_fan_boost=1.0,
+                 edge_w=0.0):
         self.use_chi = use_chi
         self.use_peng = use_peng
         self.use_gang = use_gang
@@ -109,6 +112,9 @@ class Smart(Strategy):
         self.fan_value_melds = fan_value_melds      # True=番型启发式认副露（去掉"幻影七对"加分）
         self.wait_width = wait_width                # None/"tiebreak"/"full"：听口宽度前瞻（P1-a）
         self.wait_tie_eps = wait_tie_eps            # 「近似并列」容差（占最优分比例；0=严格并列）
+        # 边张优先（用户假设的 A/B 开关，默认 0 = 关）：>0 时同向听内给边张（1/9>2/8>3/7）额外减分，
+        # 即更想打边张。注意这与现行「整手牌进张」判据可能相反（靠张重叠只算一次）——收益以配对 A/B 为准。
+        self.edge_w = edge_w
         self.claim_max_shanten = claim_max_shanten  # 非 None=只在向听 ≤ 该值时才吃/碰（鸣牌门控）
         self.claim_min_wall = claim_min_wall        # 非 None=墙剩余 < 该值后不再鸣牌
         self.keep_pairs_min = keep_pairs_min        # 非 None=无副露且对子 ≥ 该值时不鸣牌（护七对）
@@ -128,6 +134,11 @@ class Smart(Strategy):
         self.chi_narrow_max_accept = chi_narrow_max_accept
         self.chi_narrow_min_shanten = chi_narrow_min_shanten
         self.chi_prefer_narrow = chi_prefer_narrow
+        # 杠的两条门控（2026-09-25 用户指定，默认关）：
+        #   gang_tenpai_only：只在"杠完就听牌"（= 补牌可能杠开 ×2）时才杠（含明杠/补杠/可选的暗杠放宽）
+        #   gang_draw_wall ：墙剩余 < 该值且自己未听牌 → 明知赢不了也杠，用补牌多消耗墙加速流局
+        self.gang_tenpai_only = gang_tenpai_only
+        self.gang_draw_wall = gang_draw_wall
         # 复刻**线上**口径：线上把「手里所有牌（含财神）」都放进 allowed →
         # 财神也会成为出牌候选；sim 默认的 allowed=None 会把财神排除在候选池外。
         # 用来量化这个 live/sim 差异值多少分。
@@ -221,7 +232,8 @@ class Smart(Strategy):
                                 wait_width=ww,
                                 wait_tie_eps=self.wait_tie_eps,
                                 shanten_cost=self.shanten_cost, ukeire_w=self.ukeire_w,
-                                fan_weight=self.fan_weight, god_fan_boost=self.god_fan_boost)
+                                fan_weight=self.fan_weight, god_fan_boost=self.god_fan_boost,
+                                edge_w=self.edge_w)
 
     def _dealer_aggr(self, game, seat):
         """坐庄抢速副露放宽：仅当本座=庄家且 pol∈aggr*。"""
@@ -315,6 +327,8 @@ class Smart(Strategy):
             c[tile] -= 3          # 3 张做成明杠面子
             if _sh(c, nm + 1) > self.minggang_max_shanten:
                 return False
+        if not self._gang_gate_ok(game, seat, MINGGANG, tile):
+            return False
         return True  # 明杠加速（杠开 ×2 潜力）
 
     def want_hu(self, game, seat, drawn, gang_kai=False):
@@ -334,12 +348,46 @@ class Smart(Strategy):
             return False
         return True
 
+    def _gang_gate_ok(self, game, seat, kind, tile):
+        """杠的两条**用户指定**门控（2026-09-25，默认全关）。
+
+        ① `gang_tenpai_only`：只有「杠完就听牌」才杠 = 杠后补牌存在**杠开**(×2) 的可能。
+           - 明杠：3 张进副露后 `shanten(手−3, melds+1) <= 0`
+           - 补杠：第 4 张进副露后 `shanten(手−1, melds+1) <= 0`
+           - 暗杠：默认走更严的 `angang_tile`（摸前听牌 + 杠后仍听），不受此开关影响
+        ② `gang_draw_wall`：**残局加速流局** —— 墙剩余 < 该值且自己**还没听牌**（赢不了）时，
+           杠照做（用杠的补牌多消耗一张墙，加快流局，避免被对手胡走分）。它是 ① 的例外。
+        """
+        wall = game.wall_end - game.draw_pos
+        s_now = shanten(game.hands[seat], len(game.melds[seat]))
+        if self.gang_draw_wall is not None and wall < self.gang_draw_wall and s_now > 0:
+            return True                      # ② 加速流局：明知赢不了也杠
+        if not self.gang_tenpai_only:
+            return True
+        need = {ANGANG: 4, BUGANG: 1, MINGGANG: 3}[kind]
+        if game.hands[seat][tile] < need:
+            return False        # 张数不足 → 不许杠（也避免把负计数喂给 shanten）
+        c = list(game.hands[seat])
+        c[tile] -= need
+        return shanten(c, len(game.melds[seat]) + 1) <= 0
+
     def want_own_gang(self, game, seat, drawn):
         if not self.use_gang:
             return None
         hand = game.hands[seat]
         nm = len(game.melds[seat])
-        # 暗杠：4 张相同非财神。angang_tenpai_only=True（默认）只在自己听牌时杠（含七对保护）
+        wall = game.wall_end - game.draw_pos
+        # ---- 规则② 残局加速流局：未听牌 + 墙 < 阈值 → 有任何可做的杠就做（优先暗杠）----
+        # 必须放在暗杠分支**之前**：`angang_tile` 的听牌门控正是这条规则要绕开的东西。
+        if self.gang_draw_wall is not None and wall < self.gang_draw_wall \
+                and shanten(hand, nm) > 0:
+            for t in range(NUM_TILES):
+                if t != LAIZI_INDEX and hand[t] >= 4:
+                    return ANGANG, t
+            for m in game.melds[seat]:
+                if m.kind == PENG and m.tiles[0] != LAIZI_INDEX and hand[m.tiles[0]] >= 1:
+                    return BUGANG, m.tiles[0]
+        # ---- 规则① 常规：暗杠 4 张相同非财神 ----
         if self.angang_tenpai_only:
             t = angang_tile(hand, drawn, nm)
             if t is not None:
@@ -347,9 +395,12 @@ class Smart(Strategy):
         else:
             for t in range(NUM_TILES):
                 if t != LAIZI_INDEX and hand[t] >= 4:
-                    return ANGANG, t
+                    if self._gang_gate_ok(game, seat, ANGANG, t):
+                        return ANGANG, t
+                    break
         # 补杠：已碰 + 手牌有第 4 张
         for m in game.melds[seat]:
             if m.kind == PENG and m.tiles[0] != LAIZI_INDEX and hand[m.tiles[0]] >= 1:
-                return BUGANG, m.tiles[0]
+                if self._gang_gate_ok(game, seat, BUGANG, m.tiles[0]):
+                    return BUGANG, m.tiles[0]
         return None

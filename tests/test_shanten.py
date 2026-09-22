@@ -110,6 +110,19 @@ def main():
     avg_ms = dt / len(samples) * 1000
     print(f"\n性能: {len(samples)} 次 shanten 平均 {avg_ms:.3f} ms/次")
 
+    # ---- P0-4：缓存必须有上界（否则 20 局就攒到 500 万条 → 内存压力把单次决策拖到几十秒）----
+    from mahjong import shanten as _sh
+    ok = (_sh._mp.cache_info().maxsize == _sh.CACHE_MAXSIZE
+          and _sh._best.cache_info().maxsize == _sh.CACHE_MAXSIZE
+          and _sh.CACHE_MAXSIZE is not None)
+    print(f"[{'OK  ' if ok else 'FAIL'}] 缓存上界：_mp/_best maxsize = "
+          f"{_sh._mp.cache_info().maxsize}/{_sh._best.cache_info().maxsize}（CACHE_MAXSIZE={_sh.CACHE_MAXSIZE}）")
+    all_ok = all_ok and ok
+    _sh.clear_caches()
+    ok2 = _sh._mp.cache_info().currsize == 0
+    print(f"[{'OK  ' if ok2 else 'FAIL'}] clear_caches() 清空缓存（线上每局调用，保证长赛程内存不涨）")
+    all_ok = all_ok and ok2
+
     print("\n" + ("ALL PASS" if all_ok else "SOME FAILED"))
     return 0 if all_ok else 1
 

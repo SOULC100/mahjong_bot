@@ -40,6 +40,36 @@ D1_FEED_PEN = 40.0    # 基础喂牌惩罚分
 D1_HOT_MAX = 1        # 花色危险阈值：庄家观察窗口内该花色数牌弃牌数 <= D1_HOT_MAX → 判「庄家可能还在收集该花色」
 D1_WINDOW = None      # 庄家弃牌观察窗口（最近 N 张；None=全部公开弃牌）
 
+# ---- 边张优先（edge_w，**默认关**；2026-09-22 用户假设的 A/B 开关）----
+# 假设（用户提出）：中张（如 2w/6w）靠张多，边张（如 9t）靠张少，所以「先打边张」可能更划算。
+# ⚠️ 与现行判据冲突：现行 EV 看的是「打掉它之后整手牌的进张」，**靠张重叠只算一次**
+#   （真机例：留 2w 独占 8 张 < 留 9t 独占 10 张 → 引擎先打 2w）。edge_w 是**另一套假设**：
+#   边张在 ukeire 之外还有别的代价（死搭子更难补、更晚成听、更容易被别家吃走推进），
+#   故意在同一向听内给边张「减分」（score 越小越好 → 更想打它）。
+# 量纲：ukeire 质量差 1 张 ≈ 0.1 分（UKEIRE_W）→ 边张减分 ~1 分就能翻转「进张差 ≤ 10 张」的平手点；
+#       必须 << SHANTEN_COST=100，绝不越向听界（宁慢一档去追边张是明显亏的）。
+# **已测（2026-09-22，冻结基准强场 1000 局配对）：证伪 —— edge1 −0.260（z=−0.69）、edge3 −0.621（z=−1.63）、
+#   edge10 −1.275（z=−3.31）；三档全负、分半同号、剂量越大越差（胡牌率 25.2%→19.4%，只换来场均番 +0.06）。
+#   见 docs/eval-rounds.md §25。默认恒 0.0，别在线上打开。**
+EDGE_W = 0.0
+
+
+def edge_bias(tile: int) -> float:
+    """边张程度：1/9 = 3 分、2/8 = 2 分、3/7 = 1 分、其余数牌 0；字牌 0（另轴，不混进来）。
+
+    只描述「这张牌在数牌里的位置有多靠边」，不含任何牌效判断——牌效仍由向听/进张负责。
+    """
+    if tile >= 27:
+        return 0.0
+    r = tile % 9
+    if r in (0, 8):
+        return 3.0
+    if r in (1, 7):
+        return 2.0
+    if r in (2, 6):
+        return 1.0
+    return 0.0
+
 
 def _draw_quality(counts, remain=None, melds=0):
     """13 张基准手牌的进张质量（有效进张加权）。
@@ -382,11 +412,17 @@ def _fan_ting_expect(counts, melds=0, remain=None):
     对每个仍剩的可胡进张 t，用 calc_fan(补 t 后的 14 张) 试算真实倍率，
     按牌墙剩余 remain 加权求期望，再取 log2（翻倍次数，平胡=0）。
     非听牌返回 None（13 张非听牌没有可直接 calc_fan 的胡形）。
+
+    2026-09-25 修（docs/improvement-plan.md §1 记的 bug）：旧版调 calc_fan **不传 baotou**，
+    于是「4 面子 + 财神单吊」这类**真·爆头**听牌被算成平胡 ×1 → 番型估计系统性低估 ×2，
+    使 `fan_est="real*"` 的旧证伪结论（B4）不成立。修法：爆头是**摸牌前 13 张**的性质，
+    与本函数拿到的 13 张 counts 完全同源 → `baotou = any_draw_win(counts, melds)`。
     """
     if shanten(counts, melds) != 0:
         return None
     if remain is None:
         remain = [1] * NUM_TILES
+    baotou = any_draw_win(counts, melds)   # 摸前 13-3m 张「任意摸都胡」→ 每张进张都是 ×2
     tw = 0.0
     tm = 0.0
     for t in range(NUM_TILES):
@@ -397,7 +433,7 @@ def _fan_ting_expect(counts, melds=0, remain=None):
         if shanten(c2, melds) == -1:  # 摸 t 即胡
             w = float(remain[t])
             tw += w
-            tm += w * calc_fan(c2, gang_kai=False, piao_count=0)
+            tm += w * calc_fan(c2, gang_kai=False, piao_count=0, baotou=baotou)
     if tw <= 0:
         return 0.0
     return math.log2(max(tm / tw, 1.0))
@@ -488,7 +524,7 @@ def discard_decision(hand, remain=None, melds=0, depth=True, dealer=False, fan_o
                      ycb_escape_gap=0, dealer_speed=False,
                      fan_value_melds=False, wait_width=None, wait_tie_eps=0.0,
                      shanten_cost=SHANTEN_COST, ukeire_w=UKEIRE_W, fan_weight=FAN_W,
-                     god_fan_boost=1.0):
+                     god_fan_boost=1.0, edge_w=EDGE_W):
     """出牌决策：返回最优出牌 tile 索引。
 
     优先级：
@@ -532,6 +568,10 @@ def discard_decision(hand, remain=None, melds=0, depth=True, dealer=False, fan_o
     shanten_cost / ukeire_w / fan_weight: 打分权重（2026-09-03 穿参，默认=模块常量现值）。
         score = shanten×shanten_cost - ukeire×ukeire_w - fan×fan_w(fan_override)×dealer_mult；
         shanten_cost=100 时 1 向听 ≈ 单位；fan_weight 控制「番型抵消向听」力度。
+    edge_w: 边张优先偏置（**默认 0 = 关**，见模块常量 EDGE_W）。>0 时对边张候选额外减分
+        `edge_w × edge_bias(d)`（1/9=3、2/8=2、3/7=1 分），只在同向听内重排。
+        这是「中张靠张多于边张，所以先打边张」这一假设的 A/B 开关；与现行「整手牌进张」判据
+        可能相反（靠张重叠只算一次），**收益必须由冻结基准配对 A/B 判定**。
     """
     dealer_mult = 8 if dealer else 1
     if dealer_speed:
@@ -638,6 +678,10 @@ def discard_decision(hand, remain=None, melds=0, depth=True, dealer=False, fan_o
             score += d1_pen[d]  # D1：喂庄风险 → 该候选更差（同向听内重排）
         if protect_gang and hand[d] >= 4:
             score += gang_keep_pen  # 杠子保留分：不轻易拆可暗杠的四张（同向听 tiebreak）
+        if edge_w:
+            # 边张优先（默认关，见 EDGE_W）：score 越小越好 → 给边张减分 = 更想打它。
+            # 必须 << shanten_cost，只在同向听候选间重排。
+            score -= edge_w * edge_bias(d)
         if best_score is None or score < best_score - 1e-9:
             best_score = score
             best_d = d

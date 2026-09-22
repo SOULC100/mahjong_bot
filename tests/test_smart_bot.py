@@ -24,6 +24,7 @@ sys.path.insert(0, ROOT)
 sys.argv = ["smart_bot.py", "test", "test"]
 
 from mahjong.tiles import list_to_count
+from mahjong.decision import chi_combos
 import smart_bot
 
 
@@ -95,21 +96,21 @@ def main():
        and abs(st_m.raw_unseen[smart_bot.tile_from_str("5w")] * scale
                - st_m.remain[smart_bot.tile_from_str("5w")]) < 1e-6, True)
 
-    orig_chi, orig_peng = smart_bot.should_chi, smart_bot.should_peng
+    orig_chi, orig_peng = smart_bot.best_chi, smart_bot.should_peng
     peng_kwargs, chi_kwargs = [], []
     try:
-        smart_bot.should_chi = lambda *a, **k: (chi_kwargs.append(k), True)[1]   # 只测门禁，不测决策
+        smart_bot.best_chi = lambda *a, **k: (chi_kwargs.append(k), [1, 2])[1]   # 只测门禁，不测决策
         smart_bot.should_peng = lambda *a, **k: (peng_kwargs.append(k), True)[1]
         hand13 = T(0, 0, 1, 3, 4, 5, 6, 7, 8, 9, 9, 9, 13)
         st = _state(hand13)
         ck("吃 1 摊 → 允许 chi",
            smart_bot.choose_action(st, ("chi", "3w"), 2, False, False, 1),
-           {"action": "chi", "tile": "3w"})
+           {"action": "chi", "tile": "3w", "tiles": ["2w", "3w"]})
         ck("已有 2 摊吃 → 不 chi（v25）",
            smart_bot.choose_action(st, ("chi", "3w"), 3, False, False, 2), None)
         ck("chi_count 解析不出 → 不本地拦（交服务端 409）",
            smart_bot.choose_action(st, ("chi", "3w"), 1, False, False, None),
-           {"action": "chi", "tile": "3w"})
+           {"action": "chi", "tile": "3w", "tiles": ["2w", "3w"]})
         ck("碰不占吃名额：2 摊吃但当前是碰 → 允许 peng",
            smart_bot.choose_action(st, ("peng", "3w"), 3, False, False, 2),
            {"action": "peng", "tile": "3w"})
@@ -126,6 +127,69 @@ def main():
            chi_kwargs and chi_kwargs[-1].get("prefer_narrow") is smart_bot.CHI_PREFER_NARROW
            and smart_bot.CHI_PREFER_NARROW is True, True)
 
+        # ---------- R18：防庄（D1，目标函数按积分）----------
+        # 积分流向（真机/模拟一致）：付给庄家胡 −4.24/局 = 最大流出；概率每降 1pp ≈ +0.118 分/局。
+        ck("R18 防庄已上线（三套种子池化 5000 局 +0.180、z=2.18）", smart_bot.DEFEND_DEALER, True)
+        cap = []
+        orig_dd = smart_bot.discard_decision
+        try:
+            smart_bot.discard_decision = lambda *a, **k: (cap.append(k), 3)[1]
+            h_def = T(0, 0, 1, 3, 4, 5, 6, 7, 8, 9, 9, 9, 13)
+            st_d = _state(h_def, seat=0)
+            st_d.discards = [[], [], [], []]
+            st_d.melds = [[], [], [], [{"kind": "chi", "tiles": ["2t", "3t", "4t"]}]]
+            smart_bot.DEFEND_DEALER = True            # 我的下家（seat1）当庄时我才"喂庄"；庄家=seat3（我的上家）时我没风险
+            smart_bot.choose_action(st_d, ("draw", "5w"), 0, False, False, None, False,
+                                    None, False, False, dealer_seat=3)
+            ok_not_feed = cap and cap[-1].get("defend_dealer") is False
+            smart_bot.choose_action(st_d, ("draw", "5w"), 0, False, False, None, False,
+                                    None, False, False, dealer_seat=1)
+            ok_feed = (cap[-1].get("defend_dealer") is True
+                       and cap[-1].get("dealer_discards") is not None)
+            ck("D1：只在「我 = 庄家上家」时启用并传庄家弃牌", bool(ok_not_feed and ok_feed), True)
+            # 庄家已吃满 2 摊 → 不再有喂庄风险 → 关闭
+            st_d.melds[1] = [{"kind": "chi", "tiles": ["2t", "3t", "4t"]},
+                             {"kind": "chi", "tiles": ["5t", "6t", "7t"]}]
+            smart_bot.choose_action(st_d, ("draw", "5w"), 0, False, False, None, False,
+                                    None, False, False, dealer_seat=1)
+            ck("D1：庄家吃满 2 摊后关闭", cap[-1].get("defend_dealer"), False)
+        finally:
+            smart_bot.discard_decision = orig_dd
+            smart_bot.DEFEND_DEALER = False
+
+        # ---------- R16：杠的时机（2026-09-25 用户指定；规则① 已确认晋级）----------
+        # ① 只在「杠完就听牌」（补牌可能杠开 ×2）时才明杠/补杠
+        #    3000 局配对：+0.230 分/局、z=2.40，场均番 1.104→1.173（发现集 +0.368 → 确认集 +0.162）
+        ck("线上开启 GANG_TENPAI_ONLY（与冠军 genome 一致）",
+           smart_bot.GANG_TENPAI_ONLY is True, True)
+        ck("杠完不听牌 → 不许明杠",
+           smart_bot.gang_tenpai_ok(T(0, 0, 0, 5, 9, 13, 17, 21, 25, 27, 29, 31, 33, 33),
+                                    0, 0, "ming"), False)
+        ck("杠完就听牌 → 允许（1111万 234万 + 55条678条 + 白白 的 4 张…）",
+           smart_bot.gang_tenpai_ok(T(0, 0, 0, 0, 1, 2, 3, 13, 13, 14, 15, 16, 33, 33),
+                                    0, 0, "an") is True, True)
+        ck("张数不足 → 直接拒（不把负计数喂给 shanten）",
+           smart_bot.gang_tenpai_ok(T(0, 0, 1, 2, 3, 4, 5, 9, 9, 9, 13, 14, 15, 33),
+                                    0, 0, "an"), False)
+        # ② 残局加速流局（弱场 3000 局 +0.527、z=6.16；强场 0 次触发 ⇒ 免费期权）
+        ck("线上开启 GANG_DRAW_WALL=28", smart_bot.GANG_DRAW_WALL, 28)
+        #   未听牌 + 墙 25 + 手里 4 张 → 即使"杠完不听牌"也要杠（绕过听牌门控）
+        gsw = smart_bot.GANG_TENPAI_ONLY, smart_bot.GANG_DRAW_WALL
+        try:
+            smart_bot.GANG_TENPAI_ONLY, smart_bot.GANG_DRAW_WALL = True, 28
+            h_quad = T(0, 0, 0, 0, 5, 9, 13, 17, 21, 25, 27, 29, 31, 33)
+            st_q = _state(h_quad)
+            st_q.wall_remaining = 25
+            ck("规则②：未听牌 + 墙 25 + 手里 4 张 → 杠（绕过听牌门控）",
+               smart_bot.choose_action(st_q, ("draw", "8t"), 0, False, False), {"action": "gang", "tile": "1w"})
+            st_hi = _state(h_quad)
+            st_hi.wall_remaining = 40
+            act_hi = smart_bot.choose_action(st_hi, ("draw", "8t"), 0, False, False)
+            ck("规则②只在残局触发：同手牌墙 40 → 不杠（改为正常出牌）",
+               (act_hi or {}).get("action"), "discard")
+        finally:
+            smart_bot.GANG_TENPAI_ONLY, smart_bot.GANG_DRAW_WALL = gsw
+
         # ---------- v26：抓打圈豁免方 ----------
         restricted = {"catch_play": True, "god_discarder_seat": 1}  # 打财神者是 1，我 0 → 受限
         exempt = {"catch_play": True, "god_discarder_seat": 0}      # 我 = 打财神者 → 豁免
@@ -133,8 +197,9 @@ def main():
         ck("圈内受限方不吃", smart_bot.choose_action(_state(hand13, restricted), ("chi", "3w")), None)
         ck("圈内豁免方可碰", smart_bot.choose_action(_state(hand13, exempt), ("peng", "3w")),
            {"action": "peng", "tile": "3w"})
-        ck("圈内豁免方可吃", smart_bot.choose_action(_state(hand13, exempt), ("chi", "3w")),
-           {"action": "chi", "tile": "3w"})
+        act_exempt_chi = smart_bot.choose_action(_state(hand13, exempt), ("chi", "3w"))
+        ck("圈内豁免方可吃", bool(act_exempt_chi) and act_exempt_chi.get("action") == "chi"
+           and len(act_exempt_chi.get("tiles") or []) == 2, True)
         ck("god 无 god_discarder_seat（旧服务端）→ 与旧行为一致=受限",
            smart_bot.choose_action(_state(hand13, {"catch_play": True}), ("peng", "3w")), None)
         ck("无抓打圈 → 可碰", smart_bot.choose_action(_state(hand13, {}), ("peng", "3w")),
@@ -201,7 +266,25 @@ def main():
         finally:
             smart_bot.DECLINE_HU = _dh
     finally:
-        smart_bot.should_chi, smart_bot.should_peng = orig_chi, orig_peng
+        smart_bot.best_chi, smart_bot.should_peng = orig_chi, orig_peng
+
+    # ---------- v2 契约：chi 必须显式发 tiles（线上 = 离线同副搭子，2026-09-22 审计修复）----------
+    # 缺省时服务端取「第一组可行顺子」，而 sim/engine.py:213 吃的是 want_chi 返回的搭子 —— 两者
+    # 不同源时，R15「多解先消化窄搭子」（CHI_PREFER_NARROW）只影响「吃不吃」，被消耗的搭子照旧
+    # 由服务端挑，离线 +0.265 分/局 兑不了现。此处锁定「线上发的 tiles ≡ best_chi 的返回」。
+    h_multi = T(0, 0, 1, 3, 4, 5, 6, 7, 8, 9, 9, 9, 13)
+    st_multi = _state(h_multi)
+    want = orig_chi(h_multi, smart_bot.tile_from_str("3w"), 0,
+                    ukeire_gate=smart_bot.CLAIM_UKEIRE_GATE,
+                    remain=st_multi.remain, prefer_narrow=smart_bot.CHI_PREFER_NARROW)
+    want_tiles = None if want is None else [smart_bot.tile_to_str(want[0]),
+                                            smart_bot.tile_to_str(want[1])]
+    act_multi = smart_bot.choose_action(st_multi, ("chi", "3w"), 0, False, False, 0)
+    ck("同一张弃牌有多解（本例 3 组）——否则本用例测不到「选哪副」",
+       len(chi_combos(h_multi, smart_bot.tile_from_str("3w"))) >= 2, True)
+    ck("该手牌 best_chi 有解（用例前提）", want is not None, True)
+    ck("吃发的 tiles ≡ best_chi 选中的搭子（线上/离线同源）",
+       (act_multi or {}).get("tiles") == want_tiles, True)
 
     # ---------- 坐庄抢速（dealer_speed，2026-09-21 补齐线上缺口）----------
     ds_calls = []
@@ -453,6 +536,22 @@ def main():
     ck("提杠被 409 拒后不重提（poison pill）",
        len(posts_g409) >= 1 and posts_g409[0].get("action") == "gang"
        and all(p.get("action") != "gang" for p in posts_g409[1:]), True)
+
+    # ---------- CLI：令牌可写 `@文件`（免明文进 argv/进程列表；match_session.py 走这条）----------
+    import tempfile
+    tf = os.path.join(tempfile.gettempdir(), "_dsh_token_probe.txt")
+    with open(tf, "w", encoding="utf-8") as f:
+        f.write("  deadbeef" + "0" * 56 + "\n")
+    try:
+        ck("令牌 @文件 → 读文件并 strip",
+           smart_bot._token_from("@" + tf), "deadbeef" + "0" * 56)
+        ck("字面令牌照旧（含不以 @ 开头）",
+           smart_bot._token_from("abc123"), "abc123")
+        ck("_parse_args 支持 @文件 + 编号",
+           smart_bot._parse_args(["smart_bot.py", "@" + tf, "gm"])[:2],
+           ("deadbeef" + "0" * 56, "gm"))
+    finally:
+        os.remove(tf)
 
     print("\n" + ("ALL PASS" if ok else "SOME FAILED"))
     return 0 if ok else 1

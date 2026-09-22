@@ -1,7 +1,8 @@
 """正式参赛 Bot —— 接入决策引擎。
 
-用法：python smart_bot.py <令牌> [编号] [--m N] [--r N]
+用法：python smart_bot.py <令牌|@令牌文件> [编号] [--m N] [--r N]
 
+- 令牌写 `@data/global_token.txt` = 从文件读令牌（免明文进 argv / 进程列表）。
 - 参赛令牌（scoped，门户「报名」/「测试房间」派发）：报名 → 到位 → 多阶段主循环。
 - 全局令牌（门户「我的 AI 身份」签发，v24 起匿名注册已删除）：走 POST /api/match
   入席自动匹配房（v13 起自动房唯一入口，直连 register/ready 恒 409 AUTO_MATCH_ONLY）。
@@ -27,9 +28,9 @@ sys.path.insert(0, ".")
 
 from mahjong.game_state import GameState
 from mahjong.tiles import tile_from_str, tile_to_str, LAIZI_INDEX
-from mahjong.decision import should_piao, should_peng, should_chi, discard_decision, angang_tile, \
+from mahjong.decision import should_piao, should_peng, best_chi, discard_decision, angang_tile, \
     should_decline_hu, piao_after_discard
-from mahjong.shanten import shanten
+from mahjong.shanten import shanten, clear_caches
 from mahjong.fan import ycb_can_hu
 
 SERVER = "https://10.240.169.190:18080"
@@ -43,9 +44,21 @@ SERVER = "https://10.240.169.190:18080"
 KNOWN_GUIDE_VERSION = 34
 
 
+def _token_from(spec):
+    """令牌取值：`@路径` = 从文件读（免明文进 argv / 进程列表 / shell history），其余按字面量。
+
+    自由对战一场到底的入口 `match_session.py` 即用 `@data/global_token.txt` 起 bot。
+    """
+    if spec.startswith("@"):
+        with open(spec[1:].strip(), encoding="utf-8") as f:
+            return f.read().strip()
+    return spec
+
+
 def _parse_args(argv):
-    """解析 CLI：<令牌> [编号] [--m N] [--r N]。返回 (token, bot_id, m, rounds)。"""
-    token = argv[1].strip() if len(argv) > 1 else ""
+    """解析 CLI：<令牌|@令牌文件> [编号] [--m N] [--r N]。返回 (token, bot_id, m, rounds)。"""
+    raw = argv[1].strip() if len(argv) > 1 else ""
+    token = _token_from(raw) if raw else ""
     bot_id, m, r = "x", None, None
     i = 2
     while i < len(argv):
@@ -66,7 +79,7 @@ except ValueError:
     print("参数错误：--m/--r 需要整数")
     raise SystemExit(2)
 if not TOKEN:
-    print("用法: python smart_bot.py <令牌> [编号] [--m N] [--r N]")
+    print("用法: python smart_bot.py <令牌|@令牌文件> [编号] [--m N] [--r N]")
     raise SystemExit(2)
 LOG = open("data/smart_%s.log" % BOT_ID, "w", encoding="utf-8")
 
@@ -105,6 +118,45 @@ CLAIM_GATE_MAX_SHANTEN = 1  # 「等向听但质量提升」只允许前置向�
 # 对照（**没有**晋级）：向听 ≥3 时"干脆不吃宽搭子"（narrow_max_accept）发现集 +0.484 但确认集
 #   只剩 +0.021（选择效应）；且与本法组合后 +0.008 ⇒ 该门控会把本法能受益的吃挡掉。见 §22。
 CHI_PREFER_NARROW = True
+
+# ---- 边张优先（2026-09-22 用户假设，**默认关，未验证不得打开**）----
+# 假设：中张（2w/6w）单张靠张多于边张（9t），所以「先打边张」更划算。
+# 反方证据：现行判据看「打掉它之后整手牌的进张」，靠张重叠只算一次 —— 真机 room
+#   a_5b83c31e82d3 第 3 局第 5 巡：留 2w 独占 8 张 < 留 9t 独占 10 张（4w 被 6w 覆盖），
+#   引擎因此先打 2w（打后 72 张 vs 打 9t 的 70 张）。见 docs/strategy-current.md §3.13。
+# 判定方式：冻结基准配对 A/B（data/eval_run.py 的 edge1/edge3/edge10）——**已测，证伪**：
+#   强场 1000 局配对 → edge1 −0.260（z=−0.69）、edge3 −0.621（z=−1.63）、edge10 −1.275（z=−3.31），
+#   三档全负、分半同号、剂量越大越差；胡牌率 25.2%→19.4% 被压下去，只换来场均番 1.091→1.155。
+#   见 docs/eval-rounds.md §25。**保持 0.0 关闭**；开关留着是给换场强/规则时复测用。
+# 量纲见 mahjong/decision.py 的 EDGE_W（1/9=3 分、2/8=2 分、3/7=1 分；~0.1 分 ≈ 1 张进张）。
+EDGE_W = 0.0
+
+# ---- 杠的时机（2026-09-25 用户指定两条规则；冻结基准已测，等确认集通过后开启）----
+# ① GANG_TENPAI_ONLY：只有「杠完就听牌」才明杠/补杠 = 杠后补牌存在**杠开 ×2** 的可能。
+#    （暗杠本来就是更严的「摸前听牌 + 杠后仍听」，不受此开关影响）
+#    强场 1000 局配对：+0.368 分/局、+0.80pp（z=2.13，分半 +0.526/+0.210），场均番 1.091→1.162
+# ② GANG_DRAW_WALL：**残局加速流局** —— 墙剩余 < 该值且自己**未听牌**（赢不了）时照杠。
+#    机会频率：强场 0/60 局（局终墙最低档 30，够不到 28）→ 孤立效果恰好 +0.000；
+#              弱场 104 次/1000 局、局终墙<28 占 48.8% → 弱场 1000 局配对 +0.509（z=3.52）。
+#    guide v34:30「最后 10 墩（20 张）保留不摸；最后 10 墩之内禁止杠牌」→ 窗口是 20<wall<28。
+GANG_TENPAI_ONLY = True    # 只在能杠开时才明杠/补杠（3000 局确认：+0.230 分/局、z=2.40，场均番 1.104→1.173）
+GANG_DRAW_WALL = 28        # 残局未听牌时用杠"白摸一张"（弱场 3000 局确认：+0.527、z=6.16、胜率 +2.07pp；
+                           # 强场逐位相同 = 0 次触发 ⇒ 触发不了的环境里代价恰好为 0）
+
+# ---- 防庄（D1，2026-09-25：用户把目标函数摆正为「**比赛看积分，不看胜率**」）----
+# 积分流向（真机 100 局 / 模拟 400 局，两者一致，`data/_score_flow_probe.py`）：
+#   自己当庄胡 +2.64/局（每次均 +26.4）、自己当闲胡 +1.50/局、
+#   **付给庄家胡 −4.24/局**（最大流出，是"付给闲家胡 −0.28"的 15 倍）、且最赚的 10% 局占 6 成正分。
+# ⇒ 庄家胡平均让我们付 11.8 分：概率每降 1pp ≈ **+0.118 分/局**。
+# 无点炮规则里唯一有正 EV 的防守就是**别喂庄**（只有庄家能吃上家弃牌）：
+#   `_d1_penalty_vector` 按庄家公开弃牌估"他还在收集哪门/哪张"，对危险牌加罚分（同向听内重排）。
+# 只在「我 = 庄家上家」且「庄家吃摊未满 2」时启用（与 sim `Smart._d1_active` 同口径）。
+DEFEND_DEALER = True       # 已晋级（三套独立种子池化 5000 局：+0.180 分/局、z=2.18，分半 +0.172/+0.188；
+                           # 逐套 +0.150/+0.141/+0.235；场均番 1.109→1.179）
+DEFEND_PEN = 40.0          # 罚分（< SHANTEN_COST=100 ⇒ 只在同向听内重排，不牺牲自己的向听）
+DEFEND_MODE = "suit"       # "suit"（整门罚）| "pair"（按"活互补搭子数"细分到牌）
+DEFEND_HOT_MAX = 1         # 观察窗内该门弃牌数 ≤ 该值 → 判庄家可能还在收集该门
+DEFEND_WINDOW = None       # 观察窗（None = 庄家全部公开弃牌）
 
 # ---- 明杠 / 补杠（2026-09-21 冻结基准给出方向：**不加门控最好**） ----
 # 量化（1000 局冻结基准，相对已晋级的 both_gate）：
@@ -215,7 +267,8 @@ def api(method, path, body=None, auth=True):
     raise ApiError(429, "rate limited after retries")
 
 
-def choose_discard(hand, allowed_set, remain, melds=0, youcai_bikao=False, dealer_speed=False):
+def choose_discard(hand, allowed_set, remain, melds=0, youcai_bikao=False, dealer_speed=False,
+                   defend=False, dealer_discards=None):
     """在允许打出的牌集合内选最优出牌（复用 decision 引擎，depth 由 USE_DEPTH 控制）。
 
     fan_override（番型抵消 1 向听的 EV 框架）：**始终开启**。历史注释说"YCB 下保守关闭"，
@@ -223,11 +276,17 @@ def choose_discard(hand, allowed_set, remain, melds=0, youcai_bikao=False, deale
     dealer_speed：坐庄抢速（冠军 genome 的 dealer_policy="aggr"）。
     2026-09-21 补上 —— 线上此前从不传这个参数，等于**线上跑得比自己的冠军更保守**。
     ycb_escape_gap：YCB 下的"逃回平胡"门限（见 YCB_ESCAPE_GAP 的实测依据）。
+    defend / dealer_discards：**防庄（D1）** —— 只在我是庄家上家且他吃未满 2 摊时传 defend=True
+    并把庄家的公开弃牌传进来；引擎会给"庄家可能还在收集的牌"加罚分（同向听内重排）。
     """
     return discard_decision(hand, remain, melds, depth=USE_DEPTH,
                             dealer=False, fan_override=True, allowed=allowed_set,
                             youcai_bikao=youcai_bikao, dealer_speed=dealer_speed,
-                            ycb_escape_gap=(YCB_ESCAPE_GAP if youcai_bikao else 0))
+                            defend_dealer=defend, dealer_discards=dealer_discards,
+                            defend_pen=DEFEND_PEN, defend_hot_max=DEFEND_HOT_MAX,
+                            defend_window=DEFEND_WINDOW, defend_mode=DEFEND_MODE,
+                            ycb_escape_gap=(YCB_ESCAPE_GAP if youcai_bikao else 0),
+                            edge_w=EDGE_W)   # 边张优先：默认 0=关，见 EDGE_W 注释
 
 
 def can_hu(hand, melds=0, youcai_bikao=False, drawn=-1, gang_kai=False):
@@ -315,9 +374,23 @@ def bugang_tile(hand, peng_tiles):
     return None
 
 
+def gang_tenpai_ok(hand, tile, melds, kind):
+    """「杠完就听牌」判据（= 杠后补牌存在杠开 ×2 的可能）。
+
+    kind: "an" 暗杠（手里 4 张进副露）/ "bu" 补杠（第 4 张进副露）/ "ming" 明杠（手里 3 张进副露）。
+    与 sim `Smart._gang_gate_ok` 同口径（线上/sim 必须一致，否则离线结论不可外推）。
+    """
+    need = {"an": 4, "bu": 1, "ming": 3}[kind]
+    if hand[tile] < need:
+        return False        # 张数不足（状态异常/调用方没判）→ 不许杠，也避免负计数
+    c = list(hand)
+    c[tile] -= need
+    return shanten(c, melds + 1) <= 0
+
+
 def choose_action(state, phase_info, melds=0, youcai_bikao=False, skip_hu=False,
                   chi_count=None, gang_kai=False, is_dealer=None, skip_piao=False,
-                  skip_gang=False):
+                  skip_gang=False, dealer_seat=None):
     """根据局面和当前阶段选择动作。返回动作 dict 或 None。
 
     chi_count: 本人已有吃摊数（v25 服务端强制 ≤2；None = 解析不出，交服务端 409 兜底）。
@@ -362,6 +435,24 @@ def choose_action(state, phase_info, melds=0, youcai_bikao=False, skip_hu=False,
         #    只在真摸牌回合评估（tile_str 有值），碰/吃后待弃回合不杠。
         #    抓打圈内「其余玩家」也允许暗杠（规则：圈内仅禁吃/碰/明杠），故不设圈门禁。
         if tile_str and state.wall_remaining > 20 and not skip_gang:
+            # 3a. 【用户规则②】残局加速流局：墙<阈值 且自己未听牌（赢不了）→ 有杠就杠。
+            #     必须排在暗杠之前：angang_tile 的听牌门控正是这条规则要绕开的东西。
+            if (GANG_DRAW_WALL is not None and state.wall_remaining < GANG_DRAW_WALL
+                    and shanten(hand, melds) > 0):
+                quad = None
+                for q in range(34):
+                    if q != LAIZI_INDEX and hand[q] >= 4:
+                        quad = q
+                        break
+                if quad is not None:
+                    log("残局杠加速流局(暗杠): wall=%s 向听=%s"
+                        % (state.wall_remaining, shanten(hand, melds)))
+                    return {"action": "gang", "tile": tile_to_str(quad)}
+                bq = bugang_tile(hand, state.peng_meld_tiles())
+                if bq is not None:
+                    log("残局杠加速流局(补杠): wall=%s 向听=%s"
+                        % (state.wall_remaining, shanten(hand, melds)))
+                    return {"action": "gang", "tile": tile_to_str(bq)}
             gt = angang_tile(hand, state.drawn_tile, melds)
             if gt is not None:
                 return {"action": "gang", "tile": tile_to_str(gt)}
@@ -369,7 +460,8 @@ def choose_action(state, phase_info, melds=0, youcai_bikao=False, skip_hu=False,
             #     抓打圈受限方在上面第 2 步就 return 了 → 这里天然只有豁免方/无圈才走到。
             if BUGANG:
                 bt = bugang_tile(hand, state.peng_meld_tiles())
-                if bt is not None:
+                if bt is not None and (not GANG_TENPAI_ONLY
+                                       or gang_tenpai_ok(hand, bt, melds, "bu")):
                     log("补杠: 已碰 %s 且手里第 4 张" % tile_to_str(bt))
                     return {"action": "gang", "tile": tile_to_str(bt)}
         # 4. 财飘
@@ -380,8 +472,23 @@ def choose_action(state, phase_info, melds=0, youcai_bikao=False, skip_hu=False,
         if skip_piao:
             allowed_set.discard(LAIZI_INDEX)  # 打财神被拒过 → 本手牌状态不再打白
         dealer_speed = (DEALER_POLICY == "aggr" and is_dealer is True)  # 坐庄抢速（冠军口径）
+        # 防庄（D1）：只在「我 = 庄家上家」且「庄家吃摊未满 2」时启用（与 sim `_d1_active` 同口径）。
+        # 庄家只能吃上家的弃牌，所以只有这个位置存在"喂庄"风险。
+        defend = False
+        dealer_discards = None
+        if (DEFEND_DEALER and dealer_seat is not None
+                and (state.my_seat + 1) % 4 == dealer_seat):
+            dchi = 0
+            rows = state.melds[dealer_seat] if 0 <= dealer_seat < len(state.melds) else []
+            for m in (rows if isinstance(rows, list) else []):
+                if isinstance(m, dict) and str(m.get("kind", "")).lower() == "chi":
+                    dchi += 1
+            if dchi < 2:
+                defend = True
+                dealer_discards = state.discards[dealer_seat]
         d = choose_discard(hand, allowed_set, state.remain, melds, youcai_bikao,
-                           dealer_speed=dealer_speed)
+                           dealer_speed=dealer_speed, defend=defend,
+                           dealer_discards=dealer_discards)
         return {"action": "discard", "tile": tile_to_str(d)}
 
     if phase == "peng":
@@ -392,7 +499,8 @@ def choose_action(state, phase_info, melds=0, youcai_bikao=False, skip_hu=False,
         # 明杠优先于碰（与 sim/engine 的优先级一致：明杠 > 碰 > 吃）。
         # 规则：财神不能被杠 → t != LAIZI；最后 10 墩禁杠 → wall > 20。
         if (MINGGANG and not skip_gang and t != LAIZI_INDEX and hand13[t] >= 3
-                and state.wall_remaining > 20):
+                and state.wall_remaining > 20
+                and (not GANG_TENPAI_ONLY or gang_tenpai_ok(hand13, t, melds, "ming"))):
             log("明杠: 手里 3 张 %s" % tile_str)
             return {"action": "gang", "tile": tile_str}
         if should_peng(hand13, t, melds, ukeire_gate=CLAIM_UKEIRE_GATE,
@@ -407,9 +515,16 @@ def choose_action(state, phase_info, melds=0, youcai_bikao=False, skip_hu=False,
             return None  # 抓打圈受限方不能吃（打财神者本人豁免）
         if chi_count is not None and chi_count >= 2:
             return None  # v25：吃最多 2 摊（服务端 409 强制，本地先自限）
-        if should_chi(hand13, t, melds, ukeire_gate=CLAIM_UKEIRE_GATE,
-                      remain=state.remain, prefer_narrow=CHI_PREFER_NARROW):
-            return {"action": "chi", "tile": tile_str}
+        pair = best_chi(hand13, t, melds, ukeire_gate=CLAIM_UKEIRE_GATE,
+                        remain=state.remain, prefer_narrow=CHI_PREFER_NARROW)
+        if pair is not None:
+            # v2 契约（guide §2.1）：chi 可带 "tiles":["1w","2w"] 指定用哪两张手牌吃；
+            # **缺省服务端取「第一组可行顺子」**。sim/engine.py:213 吃的是 want_chi 返回的那副搭子，
+            # 所以线上必须显式带 tiles —— 否则 R15「多解时先消化补不上的窄搭子」（CHI_PREFER_NARROW，
+            # 3000 局配对 +0.265 分/局）只作用于「吃不吃」的判定，真正被消耗的搭子仍由服务端挑，
+            # 离线收益无法兑现（2026-09-22 审计发现）。
+            return {"action": "chi", "tile": tile_str,
+                    "tiles": [tile_to_str(pair[0]), tile_to_str(pair[1])]}
         return None
 
     return None
@@ -505,6 +620,9 @@ def play(gid, state, youcai_bikao=False):
                 log("⚠️ 未观测到上局 round_ended → 本局庄家未知（弃胡等庄家敏感策略按庄家保守处理）")
             round_seen = rn
             round_ended_seen = False
+            # P0-4：新一局开始时清空向听缓存（缓存只影响速度，不影响结果）。
+            # 不设上界时实测 20 局就攒到 520 万条 → 内存压力会把单次决策拖到几十秒（3s 窗口直接丢局）。
+            clear_caches()
         if my_seat < 0:
             my_seat = snap.get("seat", -1)
         state.update_from_snapshot(snap)
@@ -559,7 +677,8 @@ def play(gid, state, youcai_bikao=False):
         act = choose_action(state, phase_info, melds, youcai_bikao, skip_hu,
                             chi_count, gang_kai,
                             is_dealer=(state.my_seat == cur_dealer) if cur_dealer is not None else None,
-                            skip_piao=skip_piao, skip_gang=skip_gang)
+                            skip_piao=skip_piao, skip_gang=skip_gang,
+                            dealer_seat=cur_dealer)
         if act is None:
             continue  # pass 或无需动作：不 POST，窗口自然走满
         log("提交:", json.dumps(act, ensure_ascii=False),

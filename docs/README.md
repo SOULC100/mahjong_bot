@@ -21,6 +21,11 @@ mahjong_bot/
 ├── sim_run.py          # 模拟器 CLI（跑 N 局出胡牌率/平均分/番型）
 ├── sim_ab.py           # A/B 对比（相同牌墙隔离吃/碰/杠开关）
 ├── smart_bot.py        # 正式参赛 Bot（CLI + 协议循环 + 决策接入 + 版本自检）
+├── match_session.py    # 自由对战一场到底：入席 → 打 → 归档（元数据/日志/事件流）→ 赛后统计
+├── match_stats.py      # 自由对战跨场汇总（读 data/matches/*/stats.json）
+├── explain_round.py    # 复盘任意一局：重建手牌 + 线上判据重算每次出牌并对拍
+├── why_discard.py      # 拆解某一手：各候选打掉后的真实进张（张数/质量）逐张列出
+├── discard_ledger.py   # 两个候选的进张按花色分项做差（「留 A 换到什么、丢掉什么」）
 ├── live_loop.py        # 自动续赛 driver（逐波拉起 smart_bot + 归档）
 ├── live_smoke.py       # 真机烟测编排：4 令牌开一轮 → 并发 4 bot → 归档 + 日志扫描
 ├── verify_live.py      # 真机对局校验：吃摊≤2 / 抓打圈 / 番型与权威端点对拍
@@ -39,14 +44,28 @@ mahjong_bot/
 └── data/               # 令牌、真实对局 events、日志、抓取产物
 ```
 
+> 🧹 **工作区清理**：无引用的一次性产物搬进 `_attic/`（**不是删除**，`MANIFEST.tsv` 记原路径，
+> 整目录删掉即可；`.gitignore` 已忽略）。流程与判定口径见 docs/debug_log.md §十五，
+> 工具：`data/_cleanup_audit.py`（审计）→ `data/_cleanup_apply.py [--dry-run]`（搬移+台账）→
+> `data/_cleanup_verify.py`（校验「文档提到的 data/ 路径是否都还在 + 关键入口能否跑」）。
+> 铁律：`data/eval/**`（实验证据）与 `data/matches/**`（对局归档）永远不动。
+
 ## 牌编码
 
 | 花色 | 协议字符串 | 内核整数 |
 |------|-----------|---------|
 | 万 | `1w`-`9w` | 0-8 |
-| 筒 | `1t`-`9t` | 9-17 |
-| 条 | `1b`-`9b` | 18-26 |
+| 条 | `1t`-`9t` | 9-17 |
+| 筒 | `1b`-`9b` | 18-26 |
 | 字牌 | `东南西北中发白` | 27-33 |
+
+> ⚠️ **协议字母口径（2026-09-22 定案）**：`w`=万、**`t`=条**、**`b`=筒**——`t` 不是「筒」。
+> 证据取服务端门户自己的牌面渲染 `GET /portal/tiles.js`：`tileSVG` 里 `suit==="b"` 画圆点（筒）、
+> 否则画竹条（条）；贴图取片表 `TILE_RECT` 把 `1b` 落在底图**行0=筒**、`1t` 落在**行2=条**；
+> 门户番型计算器也把 `b` 那组标「筒子」、`t` 那组标「条子」。
+> 本仓早期注释把这两者写反了（复盘里曾把 `9t` 说成「九筒」，实为**九条**），
+> 已在 `mahjong/tiles.py` 文件头与 `tests/test_tile_coding.py` 钉死。索引顺序是内部约定、
+> 不影响任何判据与线上行为（本规则番型与花色无关）。
 
 财神 = 白板（33），百搭可替代任意牌。
 
@@ -73,9 +92,48 @@ mahjong_bot/
 | 版本自检 | v30 漂移被自动报出；基准 34 后输出 `ok: 服务器 v34 ≤ 本代码已知 v34` |
 
 复现：`python create_room.py --m 4 --r 3`（拿 4 令牌，**Rounds≥2 才有局间停顿/连庄**）→ `python live_smoke.py`
-→ `python verify_live.py <归档目录>`。
+→ `python verify_live.py <归档目录>`（结果**写文件不打印**：`data/_verify_report.txt`）
+→ `python data/_smoke_chi_parity.py <归档目录> <bot0..3 的 user_id>`（chi `tiles` 逐副对拍，见 docs/debug_log.md §十六）。
+注意：`create_room.py` 走 Playwright 浏览器登录，受限沙箱下会因命名管道失败；无浏览器路（Auth Token API）需本地 auth key 未过期。
+⚠️ `live_smoke.py` 会让 bot **覆盖** `data/smart_<i>.log`，要留证先把它复制进归档。
 注意：一个 batch 的事件流会拆成多个 block 续传，`verify_live.py` 按 round 连续回放；
 座位每局重洗（庄家按 seat 0 在用户间轮转，赢家成为下局庄家），**跨座位比分请按 `user_id` 汇总**（`data/_stats_by_user.py`）。
+
+## 自由对战（auto 房）归档与赛后统计
+
+每一场自由匹配的**对局信息、日志、赛后统计**都留档，可跨场累积复盘：
+
+```bash
+python match_session.py                 # 一场：入席 → 打 → 归档 → 统计（约 15 分钟）
+python match_session.py --sessions 3    # 连打三场（每场一个新 auto 房）
+python match_session.py --archive ROOM  # 只给已打完的房间补档（不重打）
+python match_stats.py                   # 跨场汇总（净分/胡牌率/番型/超时/chi 对拍）
+python match_stats.py --csv out.csv     # 每场一行导出
+python explain_round.py ROOM BATCH R    # 复盘某局：重建手牌 + 线上判据重算每次出牌（含对拍）
+python why_discard.py ROOM BATCH R 巡数 # 拆解某一手：各候选的真实进张张数/质量逐张列出
+python discard_ledger.py ROOM BATCH R 巡数 A B   # 两个候选的进张按花色做差（留 A 换到什么/丢掉什么）
+```
+
+**前置**：`data/global_token.txt` 放门户「我的 AI 身份」签发的全局令牌（令牌也支持
+`python smart_bot.py @data/global_token.txt <编号>` 形式，不进 argv/进程列表）。
+
+每场产出一个目录 `data/matches/<room_id>/`（`data/` 已被 gitignore）：
+
+| 文件 | 内容 |
+|------|------|
+| `session.json` | 房规、起止时间、令牌指纹（**不存明文**）、退出码、入席/终局房间快照 |
+| `bot.log` / `bot.stdout.log` | bot 完整日志 / 子进程输出 |
+| `games.json` | 场次列表（batch / game_id / round / status） |
+| `events/b<N>.json` | 每场完整事件流（四家手牌、逐局得分、动作与超时），**房关停后取不到** |
+| `stats.json` / `stats.md` | 赛后统计（结构化 / 人读）：净分名次、逐场四家得分、我的胡牌明细（番+番型）、
+副露与吃摊合规、出牌超时率、chi `tiles` 对拍 |
+
+`data/matches/index.tsv` 是全场次索引（一行一场）。两个坑已内建处理：
+① auto 房 finished 后约 60s 关停 → 归档紧跟 bot 退出执行；② 免认证数据端点 per-room 限速 5/s → 取事件流按 0.25s 间隔并 429 退避。
+补档场次（房间已关）的房规与时长分别从**日志的匹配行**和**事件流时间戳**恢复。
+
+实测样本（room `a_5b83c31e82d3`，M=10 × 8 局）：我胡 19/80（23.8%）、净分 −49、场均番 1.105、
+出牌超时 3/704（0.4%）、chi 副露 **36/36** 与决策层选中的那副一致（见 docs/debug_log.md §十二）。
 
 ## 决策引擎策略（优先级从高到低）
 
@@ -162,4 +220,5 @@ mahjong_bot/
 - [ ] **番型口径修正后的基线重跑**：v21 改动了七对倍率，旧 A/B 数值需重跑后再引用
 - [x] ~~取证脚本跨轮覆盖~~：`fetch_room_stats.py` 已按 `round+batch` 命名并校验 `game_id`，取不到的旧轮显式列入 `unavailable_old_rounds`（真机已复现该覆盖：20 条局列表只落盘 10 个文件）
 - [ ] 旧轮取证限制：免认证数据端点按 `batch` 只回**当前轮**，跨轮后旧轮取不到——需在该轮结束后立刻归档，或用 owner 会话的 `GET /portal/api/games/{id}/events`
+- [x] **chi `tiles` 真机验证**（2026-09-22：线上吃牌此前不发 `tiles`，服务端取「第一组可行顺子」≠ sim 吃的搭子 → R15「先消化窄搭子」离线收益兑不了现；改发 `best_chi` 的那副后，自由对战 room `a_5b83c31e82d3` 10 场×8 局实测 **36/36 副露与 `best_chi` 完全一致**，见 docs/debug_log.md §十二）
 - [ ] `wait_room.py` 等的 `"全部完成"` 日志标记只有遗留 `bot.py` 会打印（smart_bot 打印「本场结束/退出」）
