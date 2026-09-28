@@ -1,0 +1,2 @@
+round	cid	proposer	parent	n_block	mean	se	z	win_pp	dealer_mean	idle_mean	status	note
+r21	decline_knock	manual(replay-driven)	a14840a6da	12000	+0.883	0.074	11.86	+0.0（弱场：番型 +0.14 / 胜率 −0.1pp）			promoted 手动	弱场（vs 3×Baseline）12000 局配对：Δ分/局 +0.883（z=11.86，8000 局记方差）；强场（vs 3×Smart）6000 局：+0.476（z=4.94）；触发 ≈37 次/千局，实测存活 q≈0.89。证据：docs/eval-rounds.md §30；工具：sim_ab_knock.py / why_knock.py

@@ -5,6 +5,7 @@
 """
 import json
 import os
+import re
 import ssl
 import subprocess
 import sys
@@ -16,6 +17,35 @@ TOKEN = sys.argv[1]
 BOTID = sys.argv[2] if len(sys.argv) > 2 else "loop"
 MAXWAVE = int(sys.argv[3]) if len(sys.argv) > 3 else 0  # 0=无限直到关
 LOG = open("data/live_loop_%s.log" % BOTID, "a", encoding="utf-8")
+PENDING = os.path.join("data", "matches", "_pending")
+RE_ROOM = re.compile(r"匹配成功 room=(\S+)")
+
+
+def mark_pending(room, bot_id, log_path):
+    """落待归档标记（collect_auto.py 扫）——本 driver 归档失败/被中断时的兜底。绝不抛异常。"""
+    try:
+        os.makedirs(PENDING, exist_ok=True)
+        p = os.path.join(PENDING, "%s.json" % room)
+        old = {}
+        if os.path.exists(p):
+            try:
+                with open(p, encoding="utf-8") as f:
+                    old = json.load(f)
+            except ValueError:
+                old = {}
+        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"room_id": room,
+                       "created_at": old.get("created_at") or now, "updated_at": now,
+                       "source": "live_loop",
+                       "sources": sorted(set((old.get("sources") or []) + ["live_loop"])),
+                       "bot_id": bot_id,
+                       "log_path": log_path or old.get("log_path"),
+                       "token_file": "data/global_token.txt",
+                       "status": "pending", "attempts": 0, "last_error": None}, f,
+                      ensure_ascii=False, indent=1)
+    except Exception as e:
+        log("落待归档标记失败: %r" % (e,))
 
 
 def log(*a):
@@ -63,6 +93,17 @@ def main():
         log("--- 波 %d: 拉起 smart_bot ---" % wave)
         rc = subprocess.call([sys.executable, "smart_bot.py", TOKEN, "%s_%d" % (BOTID, wave)])
         log("smart_bot 退出 rc=%d" % rc)
+        # 本波打的房：从 bot 日志抽（auto 房每波一个新 room）→ 落兜底标记，归档失败也能被收集器收掉
+        bot_id = "%s_%d" % (BOTID, wave)
+        bot_log = "data/smart_%s.log" % bot_id
+        try:
+            txt = open(bot_log, encoding="utf-8", errors="replace").read()
+            rooms = RE_ROOM.findall(txt)
+            if rooms:
+                log("本波入席 room=%s（%d 次匹配记录）" % (rooms[-1], len(rooms)))
+                mark_pending(rooms[-1], bot_id, bot_log)
+        except FileNotFoundError:
+            log("本波日志缺失 %s，跳过落标记" % bot_log)
         # 每波打完自动归档本波对局数据（独立目录，避免覆盖上一波）
         try:
             me = api("GET", "/api/me")

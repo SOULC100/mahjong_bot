@@ -45,9 +45,16 @@
 
 1. **能胡就胡**：`can_hu(hand, melds, ycb, drawn, gang_kai)`
    = 张数正确 + `shanten == -1` +（YCB 时）`ycb_can_hu`（无财神 / 杠开 / 真爆头）。
-2. **弃胡打财飘**（`DECLINE_HU`）：能胡 **且** 打白后仍爆头（`piao_after_discard`）**且**
-   `should_decline_hu` 的 EV 成立 **且** 未超连飘上限（3）→ 提交 `discard 白`。
-   EV 判据：`q* = (f0+c)/(2f0+c)`，取 `q=0.75`；闲家 f0=2 → q*=0.70 < 0.75 → **飘**；庄家 → q*=0.83 → **不飘**。
+2. **弃胡**（`DECLINE_HU`，两条路线，见 `mahjong.decision.decline_plan`）：能胡时若「换一个更大的胡」的 EV 为正才弃。
+   - 路线 P **财飘**：打白后仍爆头（`piao_after_discard`，须手里 ≥2 张白）→ 链 +1（×2）；
+   - 路线 K **敲响**（`DECLINE_KNOCK`，2026-09-26 落地）：**打一张非财神牌后剩下 13 张仍是「任意摸都胡」**
+     → 下一摸**必胡**且按**爆头 ×2** 结算（真机 `a_41c78761ce3c_r1_b0_t0` 第 6 局的形态：3 副露 + 3t4t5t6t白，
+     摸 5t 能胡平胡 ×1，打 6t 留 3t4t5t+白 = 任意摸都胡）。
+   - EV 判据：`q* = (f0+c)/(f1+c)`（f1 = 弃胡后下一摸胡的番，要求 f1 > f0 否则纯风险）；
+     存活率估计：财飘 `DECLINE_Q=0.75`、敲响 `DECLINE_KNOCK_Q=0.90`（敲响只需活过 3 个对手行动，
+     且下一摸**必胡**；财飘 q 是反复活圈的保守值）。闲家 f0=1→f1=2 时 q*=0.79；庄家（c=8）q*=0.90。
+   - 舍牌：路线 K 打「打完仍任意摸都胡」的候选里**未见张数最少**（最"死"、最不易被吃碰）的那张；
+     抓打圈受限方只能打刚摸的牌 → 不满足则回到直接胡。
 3. **抓打圈受限**：只能打刚摸的那张（`restricted`）→ 直接返回。
 4. **【规则②】残局杠（`GANG_DRAW_WALL=28`）**：`wall_remaining < 28` **且自己未听牌** → 有杠就杠
    （暗杠 4 张优先，其次补杠）。**必须排在下面第 5 步之前**：`angang_tile` 的"听牌才杠"门控正是这条要绕开的东西。
@@ -75,8 +82,8 @@
    - 否则**向听不变但进张质量提升** → 吃；
    - 多个吃法都合格时，按 **吃后向听 → 搭子剩余进张（少者优先）→ 吃后进张质量** 排序取第一（R15 晋级）。
 
-**毒丸（防死循环）**：`skip_hu` / `skip_piao` / `skip_gang` —— 对应动作被服务端拒绝（409）后，
-在**当前手牌状态**内不再重复提交该动作。
+**毒丸（防死循环）**：`skip_hu` / `skip_piao` / `skip_gang` / `skip_knock` —— 对应动作被服务端拒绝（409）后，
+在**当前手牌状态**内不再重复提交该动作（`skip_knock` = 敲响舍牌被拒 → 本手牌回「能胡就胡」）。
 
 ---
 
@@ -196,9 +203,11 @@ score(d) = s_map[d] × SHANTEN_COST(100)
 - 1 张财神 ≈ 3 fan ≈ 15 分（闲家）→ 远小于 100 ⇒ **闲家不会为财神牺牲向听**；
 - 庄家若开 `dealer_aware`，3×5×8 = 120 > 100 ⇒ 会为财神牺牲 1 向听（**当前关闭**）。
 
-**并列处理**：冠军 `wait_width=None`（关）→ 分数精确并列时取**遍历顺序里的第一个**。
-线上候选池是 `set`（顺序由哈希决定：确定、但**不保证**按牌值升序），sim 是 `unique_tiles`（升序）
-→ 精确并列时线上/sim 理论上可能选不同的那张（影响极小：分数含 `ukeire×0.1` 浮点项，精确并列罕见）。
+**并列处理**（2026-09-26 更新，见 §3.14）：分数精确并列**并不罕见** —— 真机 11929 个出牌决策点里
+`tie_both` 能改动 18.3%、随机手 16.4%（都是**得分完全相等**的点）。线上候选池是 `set`（小整数按槽位
+升序迭代，**实际就是按牌值升序**）、sim 是 `unique_tiles`（升序）→ 两者并列时取的都是索引最小的那张
+（例：`6789w` 恒打 `6w`、`124t` 恒打 `1t`）。现在这条并列由 `TIE_VISIBLE` / `TIE_EDGE` 破平
+（先打「场上已见张多」的，再打「边张」；2026-09-26 用户规则，池化 3000 局 ≈ 0 = 零成本行为对齐）。
 `wait_width="tiebreak"` 版本（并列时按"进张×落地听口"破平）实测 **+0.055（z=1.91，未晋级）**，冠军未开。
 
 ### 3.12 一个真实算例（可复现：`python data/_discard_trace.py`）
@@ -243,6 +252,31 @@ score(d) = s_map[d] × SHANTEN_COST(100)
 复现：`python data/_marginal.py a_5b83c31e82d3 0 3 5 2w 9t 6w`（两两列出独占进张）、
 `python why_discard.py a_5b83c31e82d3 0 3 5`（全部候选排序）。
 
+### 3.14 并列破平：拆牌先打边张 + 不损牌效时先打场上已见张（2026-09-26 用户规则）
+
+**问题**：手牌含 `6789w` 时，引擎原来恒打 `6w`——查下来**不是策略结论**：`6789w` = 一副顺子
+（`678` 或 `789`）+ 一张浮牌（`9` 或 `6`），两种切法留下的 13 张**同构**（打后向听、进张集合逐张相同、
+番型相同）⇒ 得分**精确并列**；而并列时取「候选遍历顺序第一个」，线上候选池是 `set`（小整数按槽位升序）
+⇒ 索引 5 的 `6w` 恒排在索引 8 的 `9w` 前。真机归档里「含完整 `6789w` 且弃 `6w`」**13/13 全是精确并列**
+（`124t` 的 `12`/`24` 也都只听 `3t`，同理）。详见 `docs/eval-rounds.md` §31。
+
+**规则（用户指定）**：并列时① 优先打「场上已见张多（`remain` 小、留不住）」的；
+② 再优先打「边张」（`edge_bias`：1/9=3、2/8=2、3/7=1）。**只在得分完全相等时换人** ⇒ 零牌效损失。
+
+| 开关（`smart_bot.py` / `champion.json`） | 值 | 作用 |
+|---|---|---|
+| `TIE_VISIBLE` / `tie_visible` | `True` | 并列时优先打场上已见张多的那张（场况信息，**优先于**边张） |
+| `TIE_EDGE` / `tie_edge` | `True` | 并列时优先打边张（形状启发式） |
+
+与 §25 已证否的 `EDGE_W` 的区别（别混）：`EDGE_W` 是**同向听内的全局减分**，能翻转「进张差 ≤10 张」的
+候选 → 三档全负；本破平**只动得分完全相等的候选**。装置自检（真机 11929 个决策点）：翻转率
+`tie_edge` 13.1% / `tie_visible` 9.2% / 两者 18.3%，**破坏牌效 0 次**。
+
+**A/B（冻结基准配对，强场，ref=`base_g`）**：发现集 1000 局 `tie_vis` −0.123(z=−0.72) /
+`tie_edge` −0.090(z=−0.37) / `tie_both` −0.339(z=−1.25)；确认集 2000 局 +0.001 / +0.026 / +0.164
+→ **池化 3000 局 ≈ 0** ⇒ **零成本的行为对齐**（未达晋级门槛 z≥2，但也没有有害证据）。
+复现：`python data/_probe_tie_break.py --live`、`python data/eval_report.py --run tie --field strong --base base_g`。
+
 ---
 
 ## 4. 当前参数总表（线上 = 冠军）
@@ -253,6 +287,7 @@ score(d) = s_map[d] × SHANTEN_COST(100)
 |---|---|---|
 | `USE_DEPTH` | `False` | 用 `ukeire_quality`（快，~1ms）而非二次进张（旧版对听牌候选恒 0 且 ~6.9s） |
 | `DECLINE_HU` / `DECLINE_Q` / `DECLINE_MAX_CHAIN` | `True` / `0.75` / `3` | 弃胡打财飘的开关 / 存活率估计 / 连飘上限 |
+| `DECLINE_KNOCK` / `DECLINE_KNOCK_Q` | `True` / `0.90` | **弃胡敲响**（1 张白也能「留白做将」再摸一巡 ×2）的开关 / 存活率估计（2026-09-26，见 §2 第 2 步与 eval-rounds §30） |
 | `CLAIM_UKEIRE_GATE` / `CLAIM_GATE_MAX_SHANTEN` | `True` / `1` | 鸣牌 ukeire 门控（+0.33 分/局，3000 局 z=3.42） |
 | `CHI_PREFER_NARROW` | `True` | 吃多解时先消化"补不上"的搭子（+0.265 分/局，3000 局 z=2.66） |
 | `MINGGANG` / `BUGANG` | `True` / `True` | 明杠/补杠开关 |
@@ -262,6 +297,7 @@ score(d) = s_map[d] × SHANTEN_COST(100)
 | `DEALER_POLICY` | `"aggr"` | 坐庄抢速（+0.29 分/局） |
 | `YCB_ESCAPE_GAP` | `1` | YCB 逃回门限（**仅 YCB 场生效**，当前不计入预期） |
 | `EDGE_W` | `0.0`（**关**） | **边张优先偏置**（用户假设：中张靠张多 → 先打 9t 这种边张）。>0 时同向听内给边张减分（1/9=3、2/8=2、3/7=1，约 0.1 分 ≈ 1 张进张）。**与现行「整手牌进张」判据可能相反**（靠张重叠只算一次，见 §3.13）→ 结论以冻结基准配对 A/B 为准（`data/eval_run.py` 的 `edge1/edge3/edge10`），未过确认集不得打开 |
+| `TIE_VISIBLE` / `TIE_EDGE` | `True` / `True` | **并列破平**（§3.14，2026-09-26 用户规则）：只在两个候选**得分完全相等**时换人——先打「场上已见张多」的，再打「边张」。零牌效损失；池化 3000 局 ≈ 0（零成本的行为对齐，非增益）；一键回退 |
 
 ### 4.2 `opt/champion.json`（出牌打分相关的）
 
@@ -275,7 +311,8 @@ score(d) = s_map[d] × SHANTEN_COST(100)
 | `god_fan_boost` | 1.0（默认） | 手握财神时番型权重放大（**惰性**，实测无差别） |
 | `baotou_slack` / `baotou_max_shanten` | 1 / 1 | 爆头路线阈值（当庄时被抢速覆盖为 0/0） |
 | `piao_enabled` / `piao_dealer_only` | true / false | 财飘开；庄闲都飘 |
-| `decline_hu` / `decline_q` / `decline_max_chain` | true / 0.75 / 3 | 弃胡 |
+| `decline_hu` / `decline_q` / `decline_max_chain` | true / 0.75 / 3 | 弃胡（财飘路线） |
+| `decline_knock` / `decline_knock_q` | true / 0.90 | 弃胡（敲响路线，与线上 `DECLINE_KNOCK*` 同口径） |
 | `dealer_policy` | `"aggr"` | 坐庄抢速 |
 | `dealer_aware` | **false** | 出牌打分里**不用**庄家×8 |
 | `use_ev`（= `fan_override`） | true | 番型可抵消 1 向听（**恒开**；关掉 YCB 下 −0.67） |
@@ -283,7 +320,7 @@ score(d) = s_map[d] × SHANTEN_COST(100)
 | `angang_tenpai_only` | true | 暗杠只在听牌时 |
 | `fan_est` | `"heuristic"` | 番型估计口径 |
 | `ycb_escape_gap` | 1 | 仅 YCB |
-| `defend_dealer` / `knock` / `fan_value_melds` | false / false / false | 防守、敲响路线、去幻影七对 —— 均未启用 |
+| `defend_dealer` / `knock` / `fan_value_melds` | false / false / false | 防守、**出牌层面的**敲响路线（=向听并入财神做将；数学惰性）、去幻影七对 —— 均未启用。注意与 `decline_knock` 区分：后者是**能胡时的弃胡决策**，与向听路线无关，已启用 |
 
 ---
 
@@ -292,7 +329,7 @@ score(d) = s_map[d] × SHANTEN_COST(100)
 | 项 | 结论 |
 |---|---|
 | `ukeire_depth`（`USE_DEPTH=True`） | 对听牌候选恒 0，且 ~6.9s/次（超 3s 窗口） |
-| `knock`（敲响/七客路线） | 数学上惰性（3.5 万随机手 0 次改变决策） |
+| `knock`（敲响/七客路线，**出牌向听**层面） | 数学上惰性（3.5 万随机手 0 次改变决策）。**能胡时的「弃胡敲响」是另一回事**：`DECLINE_KNOCK`（2026-09-26），见 §2 第 2 步 |
 | 权重类（`ukeire_w`/`fan_weight`/`god_fan_boost`） | 改 2~4 倍 → 0/475 个决策变化（向听项主导） |
 | `wait_width`（含 `full`） | 破平版 +0.055（z=1.91）；`full` 版 **有害**（−0.634） |
 | `defend_dealer`（喂庄防守） | 冠军 `false`；本轮**未单独 A/B**（规则"只能自摸"不影响它的动机——防的是庄家吃牌抢速） |
@@ -309,6 +346,7 @@ score(d) = s_map[d] × SHANTEN_COST(100)
 |---|---|---|
 | 胡 | 张数正确 + `shanten==-1` +（YCB）`ycb_can_hu` | — |
 | 弃胡打财飘 | 见 §2 第 2 步 | `DECLINE_Q=0.75`、`max_chain=3` |
+| 弃胡敲响 | 见 §2 第 2 步（打一张后仍「任意摸都胡」→ 下一摸必胡 ×2） | `DECLINE_KNOCK=true`、`DECLINE_KNOCK_Q=0.90` |
 | 财飘（主动） | `piao_after_discard` | `piao_enabled=true` |
 | 暗杠 | 摸前听牌 + 杠后仍听（**残局未听牌时例外**：墙<28 → 照杠） | `angang_tenpai_only=true`、`GANG_DRAW_WALL=28` |
 | 补杠 | 已碰 + 手第 4 张，`wall>20`，**杠完就听牌**（`GANG_TENPAI_ONLY`） | `BUGANG=true` |

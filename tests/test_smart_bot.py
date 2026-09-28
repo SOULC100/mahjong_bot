@@ -127,9 +127,12 @@ def main():
            chi_kwargs and chi_kwargs[-1].get("prefer_narrow") is smart_bot.CHI_PREFER_NARROW
            and smart_bot.CHI_PREFER_NARROW is True, True)
 
-        # ---------- R18：防庄（D1，目标函数按积分）----------
+        # ---------- R18/R22：防庄（D1，目标函数按积分）----------
         # 积分流向（真机/模拟一致）：付给庄家胡 −4.24/局 = 最大流出；概率每降 1pp ≈ +0.118 分/局。
-        ck("R18 防庄已上线（三套种子池化 5000 局 +0.180、z=2.18）", smart_bot.DEFEND_DEALER, True)
+        # 【2026-09-23】干净口径（ref=base_g）三套种子全负（−0.262/−0.045/−0.035）、池化 5000 局
+        #   −0.084（z=−1.75）、无一次为正 ⇒ 关闭（判断，非"已证有害"）。见 action-plan §3-R1。
+        ck("R22 防庄已关闭（干净口径池化 5000 局 −0.084、z=−1.75、三套全负）",
+           smart_bot.DEFEND_DEALER, False)
         cap = []
         orig_dd = smart_bot.discard_decision
         try:
@@ -552,6 +555,59 @@ def main():
            ("deadbeef" + "0" * 56, "gm"))
     finally:
         os.remove(tf)
+
+    # ---------- P0 修复：庄家跟踪失效 → 用快照累计积分差分恢复（2026-09-22）----------
+    # 背景：每次动作后 seq=0 会吞掉 round_ended，实测 35.7% 的局「庄家未知」→ dealer_speed/D1 静默失效。
+    # 规则：累计分差分全 0 = 流局（庄家连庄）；否则 argmax = 赢家 → 下局庄家。归档全量验证 694/694。
+    dfs = smart_bot.dealer_from_scores
+    ck("庄家恢复：闲家 seat2 胡 → 下局庄=2",
+       dfs([0, 0, 0, 0], [-2, -2, 20, -16])[0], 2)
+    ck("庄家恢复：庄家 seat3 胡（自己续坐）",
+       dfs([10, -1, -1, -8], [-8, -8, -8, 24])[0], 3)
+    ck("庄家恢复：流局（差分全 0）→ None（调用方保留原庄家）",
+       dfs([5, 5, 5, 5], [5, 5, 5, 5]), (None, [0, 0, 0, 0]))
+    ck("庄家恢复：首个快照（prev=None）→ None 不猜",
+       dfs(None, [1, 2, 3, 4]), (None, None))
+    ck("庄家恢复：非法输入不崩",
+       (dfs([1, 2, 3, 4], "x"), dfs([1, 2, 3, 4], [1, 2, 3])),
+       ((None, None), (None, None)))
+    ck("庄家恢复：delta 一并返回（供日志）",
+       dfs([0, 0, 0, 0], [-1, -1, 10, -8])[1], [-1, -1, 10, -8])
+
+    # 集成：scores 变化时应恢复庄家、且**不再**报「未观测到上局 round_ended」
+    logs = []
+    orig_log = smart_bot.log
+    snap_r1 = {"seq": 1, "snapshot": {"seat": 1, "phase": "draw", "turn": 1, "round_no": 1,
+                                      "my_hand": ["1w"] * 14, "scores": [0, 0, 0, 0],
+                                      "melds": [[], [], [], []], "discards": [[], [], [], []],
+                                      "drawn_tile": "1w"}}
+    snap_r2 = {"seq": 2, "snapshot": {"seat": 1, "phase": "draw", "turn": 1, "round_no": 2,
+                                      "my_hand": ["1w"] * 14, "scores": [-1, 10, -1, -8],
+                                      "melds": [[], [], [], []], "discards": [[], [], [], []],
+                                      "drawn_tile": "1w"}}
+    seq_calls = {"n": 0}
+
+    def fake_api_dealer(method, path, body=None, auth=True):
+        if method == "POST":
+            return {"finished": True}
+        seq_calls["n"] += 1
+        if seq_calls["n"] == 1:
+            return snap_r1
+        if seq_calls["n"] == 2:
+            return snap_r2
+        return {"finished": True, "snapshot": {"scores": [-1, 10, -1, -8]}}
+
+    smart_bot.log = lambda *a: logs.append(" ".join(str(x) for x in a))
+    orig_api3 = smart_bot.api
+    smart_bot.api = fake_api_dealer
+    try:
+        smart_bot.play("gdealer", smart_bot.GameState(), False)
+    finally:
+        smart_bot.api = orig_api3
+        smart_bot.log = orig_log
+    joined = "\n".join(logs)
+    ck("scores 差分 → 记录「庄家恢复」", "庄家恢复（快照 scores 差）" in joined, True)
+    ck("恢复成功后不再报「庄家未知」", "未观测到上局 round_ended" in joined, False)
 
     print("\n" + ("ALL PASS" if ok else "SOME FAILED"))
     return 0 if ok else 1

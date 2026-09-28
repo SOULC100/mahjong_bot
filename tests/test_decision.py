@@ -14,6 +14,8 @@ from mahjong.decision import discard_decision, discard_decision_full, \
     _fan_ting_expect, _fan_value_real
 from mahjong import decision
 from mahjong.fan import any_draw_win
+from mahjong.shanten import shanten
+from mahjong.ukeire import ukeire_quality, ting_count
 
 
 def T(*tiles):
@@ -91,6 +93,89 @@ def test_fan_est_baotou():
     return ok
 
 
+def test_tie_break():
+    """并列破平（2026-09-26 用户规则）：拆牌先打边张（6789w→9w、124t→1t）+ 不损牌效时先打已见张。
+
+    背景：`discard_decision` 在**得分完全相等**时取候选遍历顺序第一个，而线上候选池是 set
+    （小整数按槽位升序）⇒ 6789w 恒打 6w。真机 13/13、随机 8000 手 89% 都是这种并列
+    （data/_probe_6789*.py）。本破平只在并列内换人，**不许**触碰任何有真实分差的候选。
+    """
+    ok = True
+
+    def ck(name, got, want):
+        nonlocal ok
+        good = got == want
+        ok = ok and good
+        print("[%s] %s: got=%r want=%r" % ("OK  " if good else "FAIL", name, got, want))
+        return good
+
+    kw = dict(depth=False, dealer=False, fan_override=True, allowed=None, youcai_bikao=False,
+              dealer_speed=False)
+    rem_u = [4.0] * NUM_TILES
+
+    # 真机牌形 a_10afdb245ade 第4局第5巡：6789w = 顺子 + 浮牌 → 打 6w / 打 9w 严格同分
+    h6789 = T(4, 4, 5, 6, 7, 8, 10, 12, 14, 16, 23, 24, 25, 25)
+    ck("6789w 默认（并列取索引小者）→ 打 6万",
+       tile_name(discard_decision(h6789, rem_u, 0, **kw)), "6万")
+    ck("6789w + tie_edge → 打 9万（拆牌先打边张）",
+       tile_name(discard_decision(h6789, rem_u, 0, tie_edge=True, **kw)), "9万")
+    ck("6789w + tie_visible（remain 均匀=无信号）→ 仍是 6万",
+       tile_name(discard_decision(h6789, rem_u, 0, tie_visible=True, **kw)), "6万")
+
+    # 场况信息：9w 已见 3 张（remain=1）→ 留不住的牌先打
+    rem_9 = list(rem_u)
+    rem_9[tile_from_str("9w")] = 1.0
+    ck("6789w + tie_visible（9w 已见3）→ 打 9万",
+       tile_name(discard_decision(h6789, rem_9, 0, tie_visible=True, **kw)), "9万")
+    rem_6 = list(rem_u)
+    rem_6[tile_from_str("6w")] = 1.0
+    rem_6[tile_from_str("9w")] = 3.0
+    ck("6789w + tie_visible（6w 已见3、9w 新鲜）→ 打 6万（场况优先于形状）",
+       tile_name(discard_decision(h6789, rem_6, 0, tie_visible=True, **kw)), "6万")
+    ck("6789w + tie_both（场况与形状冲突时场况优先）→ 打 6万",
+       tile_name(discard_decision(h6789, rem_6, 0, tie_visible=True, tie_edge=True, **kw)), "6万")
+    # 真机那手的并列集合其实是 {6w, 9w, 8b}（跨门）——「拆牌」只是典型来源、不是可判定范围，
+    # 所以 tie_edge 按「并列内谁更靠边」生效：6w(0) < 8b(2) < 9w(3) → 打 9w（正是用户要的）。
+    ck("6789w 并列集合含跨门牌时仍按边张分排序 → 打 9万",
+       tile_name(discard_decision(h6789, rem_u, 0, tie_edge=True, **kw)), "9万")
+
+    # 124t 形听牌（12 / 24 都只听 3t）：切 1t 与切 4t 同分；默认已按索引打 1t
+    h124 = T(9, 10, 12, 5, 6, 7, 22, 23, 24, 19, 19, 27, 27, 27)
+    ck("124t 听牌形 默认 → 打 1条", tile_name(discard_decision(h124, rem_u, 0, **kw)), "1条")
+    ck("124t + tie_edge → 仍打 1条（边张优先，方向一致）",
+       tile_name(discard_decision(h124, rem_u, 0, tie_edge=True, **kw)), "1条")
+    rem_4t = list(rem_u)
+    rem_4t[tile_from_str("4t")] = 1.0
+    ck("124t + tie_visible（4t 已见3）→ 打 4条（留不住的牌先打）",
+       tile_name(discard_decision(h124, rem_4t, 0, tie_visible=True, **kw)), "4条")
+
+    # 安全性：拆分必须**只在并列内**发生 —— 逐手复算 off/on 的打分三项，必须逐项相同
+    hand_e = T(1, 5, 10, 11, 12, 12, 17, 18, 19, 23, 23, 24, 33, 33)  # 单测 §edge_w 的那手
+    def comps(hand, d, remain):
+        c = list(hand)
+        c[d] -= 1
+        s = shanten(c, 0)
+        u = ting_count(c, remain, 0) if s == 0 else ukeire_quality(hand, d, remain, 0)
+        return (s, u, decision._fan_value(c, 0, melds_aware=False))
+
+    unsafe = 0
+    checked = 0
+    for hand in (h6789, h124, hand_e):
+        for mods in ({}, {"9w": 1.0}, {"6w": 1.0, "9w": 2.0}, {"4t": 1.0}, {"1t": 1.0}):
+            rem = list(rem_u)
+            for name, v in mods.items():
+                rem[tile_from_str(name)] = v
+            base = discard_decision(hand, rem, 0, **kw)
+            for flags in (dict(tie_edge=True), dict(tie_visible=True),
+                          dict(tie_edge=True, tie_visible=True)):
+                got = discard_decision(hand, rem, 0, **flags, **kw)
+                checked += 1
+                if got != base and comps(hand, got, rem) != comps(hand, base, rem):
+                    unsafe += 1
+    ck("破平零牌效损失：%d 次对照中破坏打分三项的次数" % checked, unsafe, 0)
+    return ok
+
+
 def main():
     ok = True
 
@@ -115,6 +200,9 @@ def main():
 
     # 5. fan_est="real*" 的爆头漏算修复
     ok = test_fan_est_baotou() and ok
+
+    # 5b. 并列破平（2026-09-26 用户规则）：6789w→9w / 124t→1t / 不损牌效时先打已见张
+    ok = test_tie_break() and ok
 
     # 6. 边张优先开关 edge_w（默认关；2026-09-22 用户假设的 A/B 开关）
     #    真机复盘手牌 room a_5b83c31e82d3 第 3 局第 5 巡：2w 6w 2t3t4t4t 9t 1b2b6b6b7b 白白。

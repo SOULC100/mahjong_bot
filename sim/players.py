@@ -11,9 +11,9 @@
 """
 
 from mahjong.tiles import NUM_TILES, LAIZI_INDEX
-from mahjong.shanten import shanten
-from mahjong.decision import discard_decision, should_peng, best_chi, angang_tile, \
-    should_decline_hu, SHANTEN_COST as _SC, UKEIRE_W as _UW, FAN_W as _FW
+from mahjong.shanten import shanten, shanten_baotou
+from mahjong.decision import discard_decision, should_peng, best_chi, chi_combos, angang_tile, \
+    should_decline_hu, decline_plan, SHANTEN_COST as _SC, UKEIRE_W as _UW, FAN_W as _FW
 
 from sim.engine import ANGANG, BUGANG, CHI, MINGGANG, PENG
 from sim.infer import infer_remain
@@ -68,7 +68,8 @@ class Smart(Strategy):
                  defend_dealer=False, defend_pen=40.0, defend_window=None, defend_hot_max=1, defend_mode="suit",
                  fan_est="heuristic", angang_tenpai_only=True, protect_gang=True, knock=False,
                  ycb_escape_gap=0, dealer_policy="off", decline_hu=False, decline_q=0.75,
-                 decline_max_chain=3, remain_live_style=False, fan_value_melds=False,
+                 decline_max_chain=3, decline_knock=False, decline_knock_q=0.90,
+                 remain_live_style=False, fan_value_melds=False,
                  wait_width=None, wait_tie_eps=0.0, claim_max_shanten=None, claim_min_wall=None,
                  keep_pairs_min=None, claim_gate_min_gain=0.0, use_minggang=True,
                  minggang_max_shanten=None, minggang_min_wall=None,
@@ -77,7 +78,29 @@ class Smart(Strategy):
                  gang_tenpai_only=False, gang_draw_wall=None,
                  chi_narrow_max_accept=None, chi_narrow_min_shanten=None, chi_prefer_narrow=False,
                  shanten_cost=_SC, ukeire_w=_UW, fan_weight=_FW, god_fan_boost=1.0,
-                 edge_w=0.0):
+                 edge_w=0.0, bao_claim=False, bao_claim_sb=1, bao_claim_max_melds=2,
+                 bao_claim_loose=False, bao_w=0.0, bao_slack=1.0, bao_plan=False, bao_max_cost=1,
+                 plan_mode="off", plan_fan_mult=2.0, plan_margin=0.0,
+                 peng_bao_live=False, peng_bao_live_max_melds=2, peng_bao_live_slack=1,
+                 peng_bao_live_need_white=True, peng_bao_live_need_route=True,
+                 plan_bao_live=False, plan_bao_live_slack=1, plan_bao_live_max_sb=None,
+                 plan_bao_live_min_melds=0, plan_bao_live_cand=False,
+                 shape_nat_w=0.0, shape_iso_w=0.0,
+                 tie_visible=False, tie_edge=False):
+        # R7/H-peng：碰门「形状判据」（默认全关 ⇒ 与基线逐决策一致，见 docs/action-plan-2026-09-23.md §3-R7）
+        self.peng_bao_live = peng_bao_live
+        self.peng_bao_live_max_melds = peng_bao_live_max_melds
+        self.peng_bao_live_slack = peng_bao_live_slack
+        self.peng_bao_live_need_white = peng_bao_live_need_white
+        self.peng_bao_live_need_route = peng_bao_live_need_route
+        self.plan_bao_live = plan_bao_live
+        self.plan_bao_live_slack = plan_bao_live_slack
+        self.plan_bao_live_max_sb = plan_bao_live_max_sb
+        self.plan_bao_live_min_melds = plan_bao_live_min_melds
+        self.plan_bao_live_cand = plan_bao_live_cand   # R8b：逐候选口径入场（≈持白即保留白做将）
+        # L1 形状软定价（默认 0 = 关；见 docs/shape-engine-design.md §3）
+        self.shape_nat_w = shape_nat_w
+        self.shape_iso_w = shape_iso_w
         self.use_chi = use_chi
         self.use_peng = use_peng
         self.use_gang = use_gang
@@ -107,6 +130,11 @@ class Smart(Strategy):
         self.decline_hu = decline_hu              # 弃胡：能胡时若「打白续飘」EV 为正则弃（默认关=旧行为）
         self.decline_q = decline_q                # 弃胡判据里的「活过一圈」存活率估计 q
         self.decline_max_chain = decline_max_chain  # 连飘上限
+        self.decline_knock = decline_knock        # 敲响弃胡（2026-09-26）：打一张非财神牌后仍「任意摸都胡」
+        self.decline_knock_q = decline_knock_q    # 敲响的存活率估计（只需活过 3 个对手行动）
+        # 弃胡计数/落点（A/B 报告用；不影响决策）：把「路线、f0→f1、q*」逐次记下来
+        self.decline_log = []
+        self._decline_pending = {}   # seat -> 弃胡时要打的牌（want_hu → choose_discard 的交接）
         # 冻结基准候选（2026-09-20）：
         self.remain_live_style = remain_live_style  # True=复刻**线上口径**的 remain（漏算副露）→ 量化 live/sim 差距
         self.fan_value_melds = fan_value_melds      # True=番型启发式认副露（去掉"幻影七对"加分）
@@ -115,6 +143,26 @@ class Smart(Strategy):
         # 边张优先（用户假设的 A/B 开关，默认 0 = 关）：>0 时同向听内给边张（1/9>2/8>3/7）额外减分，
         # 即更想打边张。注意这与现行「整手牌进张」判据可能相反（靠张重叠只算一次）——收益以配对 A/B 为准。
         self.edge_w = edge_w
+        # 并列破平（2026-09-26 用户规则「拆牌先打边张 / 不损牌效时先打场上已见张」）：
+        # 只在候选**得分完全相等**时换人（零牌效损失），与全局偏置 edge_w 不是一回事。
+        # 判据与证据见 mahjong/decision.py 的 TIE_VISIBLE / TIE_EDGE 注释块。
+        self.tie_visible = tie_visible
+        self.tie_edge = tie_edge
+        # 持白鸣牌放宽（bao_claim，默认关）：见下面 _bao_claim_ok 的注释与
+        # docs/opp-baotou-teardown.md。sb = 允许的爆头路线向听上限；max_melds = 只在前几摊放宽。
+        self.bao_claim = bao_claim
+        self.bao_claim_sb = bao_claim_sb
+        self.bao_claim_max_melds = bao_claim_max_melds
+        self.bao_claim_loose = bao_claim_loose
+        # 主动追爆头（bao_w，默认关）：见 mahjong/decision.py 的 BAO_W 与 docs/eval-rounds.md §28
+        self.bao_w = bao_w
+        self.bao_slack = bao_slack
+        self.bao_plan = bao_plan
+        self.bao_max_cost = bao_max_cost
+        # 手级双计划 EV（plan_mode="ev"，默认 off）：见 mahjong/decision.py 的 PLAN_MODE 与 §28/§29
+        self.plan_mode = plan_mode
+        self.plan_fan_mult = plan_fan_mult
+        self.plan_margin = plan_margin
         self.claim_max_shanten = claim_max_shanten  # 非 None=只在向听 ≤ 该值时才吃/碰（鸣牌门控）
         self.claim_min_wall = claim_min_wall        # 非 None=墙剩余 < 该值后不再鸣牌
         self.keep_pairs_min = keep_pairs_min        # 非 None=无副露且对子 ≥ 该值时不鸣牌（护七对）
@@ -193,6 +241,12 @@ class Smart(Strategy):
     def choose_discard(self, game, seat):
         hand = game.hands[seat]  # 14 张（含刚摸的）
         nm = len(game.melds[seat])
+        # 弃胡计划留下的「指定舍牌」优先（2026-09-26）：want_hu 决定弃胡时会把要打的牌 +
+        # 当时的手牌快照记在这里（财飘 = 白；敲响 = 打完仍是「任意摸都胡」的那张非财神牌）。
+        # 手牌快照不一致 = 中间发生了杠/局面变了 → 作废，走正常出牌判据（防串到下一局）。
+        pend = self._decline_pending.pop(seat, None)
+        if pend is not None and pend[0] is not None and tuple(hand) == pend[1] and hand[pend[0]] > 0:
+            return pend[0]
         remain = self._remain(game, seat)
         pol = self.dealer_policy
         is_dealer = (game.dealer == seat)
@@ -233,7 +287,17 @@ class Smart(Strategy):
                                 wait_tie_eps=self.wait_tie_eps,
                                 shanten_cost=self.shanten_cost, ukeire_w=self.ukeire_w,
                                 fan_weight=self.fan_weight, god_fan_boost=self.god_fan_boost,
-                                edge_w=self.edge_w)
+                                edge_w=self.edge_w, bao_w=self.bao_w, bao_slack=self.bao_slack,
+                                bao_plan=self.bao_plan, bao_max_cost=self.bao_max_cost,
+                                plan_mode=self.plan_mode, plan_fan_mult=self.plan_fan_mult,
+                                plan_margin=self.plan_margin,
+                                plan_bao_live=self.plan_bao_live,
+                                plan_bao_live_slack=self.plan_bao_live_slack,
+                                plan_bao_live_max_sb=self.plan_bao_live_max_sb,
+                                plan_bao_live_min_melds=self.plan_bao_live_min_melds,
+                                plan_bao_live_cand=self.plan_bao_live_cand,
+                                shape_nat_w=self.shape_nat_w, shape_iso_w=self.shape_iso_w,
+                                tie_visible=self.tie_visible, tie_edge=self.tie_edge)
 
     def _dealer_aggr(self, game, seat):
         """坐庄抢速副露放宽：仅当本座=庄家且 pol∈aggr*。"""
@@ -260,6 +324,48 @@ class Smart(Strategy):
                 return False
         return True
 
+    # ---- 持白鸣牌放宽（bao_claim，2026-09-22 逆向工程提出的唯一有量级通道）----
+    # 证据（docs/opp-baotou-teardown.md）：爆头听牌态 我 0.94% vs 对手 3.05%（3.2×），而
+    # 听牌→胡转化率相同（83% vs 79%）、出牌层 18/18 全抓住 ⇒ 差距在「到达」。
+    # 根因=副露太少：持白时碰转化 我 34.9% vs 对手 68.2%；爆头率随面子数 13.7→14.8→26.1→50.9%。
+    # 判据：手里白 ≥1 且副露 < bao_claim_max_melds（默认 2）时，若这次鸣牌后**仍存在**一个出牌
+    # 让爆头路线活着（min_d shanten_baotou(h13_打d, m+1) ≤ bao_claim_sb），就鸣。
+    # 注意：这是**放宽**门控（多了原本不鸣的鸣牌），必须走 base_g 同底的配对 A/B 才可上线。
+    def _bao_claim_ok(self, game, seat, tile, consume):
+        """鸣牌消耗 consume（两张手牌）后，是否还留得住爆头路线。"""
+        h = list(game.hands[seat])
+        for c in consume:
+            if h[c] <= 0:
+                return False
+            h[c] -= 1
+        m = len(game.melds[seat]) + 1
+        if self.bao_claim_loose:
+            # 宽松版：不要求"保住爆头路线"，只要求鸣牌后（打一张）**普通向听不变差**。
+            # 动机：对手持白碰转化 68.2% vs 我 34.9%，但他们的额外碰未必在碰的当下就保住爆头路线——
+            # 更可能是"先堆面子数（m 越大越容易形成 4 面子 + 白）"。路线保持版实测 Δ≈0 ⇒ 试这一版。
+            s_now = shanten(game.hands[seat], len(game.melds[seat]))
+            for d in range(NUM_TILES):
+                if h[d] <= 0:
+                    continue
+                h2 = list(h)
+                h2[d] -= 1
+                if shanten(h2, m) <= s_now:
+                    return True
+            return False
+        for d in range(NUM_TILES):
+            if h[d] <= 0:
+                continue
+            h2 = list(h)
+            h2[d] -= 1
+            if shanten_baotou(h2, m) <= self.bao_claim_sb:
+                return True
+        return False
+
+    def _bao_claim_ready(self, game, seat):
+        return (self.bao_claim
+                and game.hands[seat][LAIZI_INDEX] >= 1
+                and len(game.melds[seat]) < self.bao_claim_max_melds)
+
     def want_peng(self, game, seat, tile):
         if not self.use_peng:
             return False
@@ -269,11 +375,27 @@ class Smart(Strategy):
         gate = self.peng_ukeire_gate or self._dealer_aggr(game, seat)
         if gate:
             max_sh = self.peng_gate_max_shanten if self.peng_gate_max_shanten is not None else 1
-            return should_peng(game.hands[seat], tile, nm,
-                               ukeire_gate=True, remain=self._remain(game, seat),
-                               gate_max_shanten=max_sh,
-                               gate_min_gain=self.claim_gate_min_gain)
-        return should_peng(game.hands[seat], tile, nm)
+            if should_peng(game.hands[seat], tile, nm,
+                           ukeire_gate=True, remain=self._remain(game, seat),
+                           gate_max_shanten=max_sh,
+                           gate_min_gain=self.claim_gate_min_gain,
+                           bao_live=self.peng_bao_live,
+                           bao_live_max_melds=self.peng_bao_live_max_melds,
+                           bao_live_slack=self.peng_bao_live_slack,
+                           bao_live_need_white=self.peng_bao_live_need_white,
+                           bao_live_need_route=self.peng_bao_live_need_route):
+                return True
+        elif should_peng(game.hands[seat], tile, nm,
+                         bao_live=self.peng_bao_live,
+                         bao_live_max_melds=self.peng_bao_live_max_melds,
+                         bao_live_slack=self.peng_bao_live_slack,
+                         bao_live_need_white=self.peng_bao_live_need_white,
+                         bao_live_need_route=self.peng_bao_live_need_route):
+            return True
+        # bao_claim：持白且早巡 → 为了「4 面子 + 白」的形状，放宽碰
+        if self._bao_claim_ready(game, seat) and game.hands[seat][tile] >= 2:
+            return self._bao_claim_ok(game, seat, tile, [tile, tile])
+        return False
 
     def want_chi(self, game, seat, tile):
         if not self.use_chi:
@@ -293,17 +415,28 @@ class Smart(Strategy):
             # 2026-09-21 曾在这里给「坐庄抢速」路径偷偷塞了一个 max_sh=1 → 让 dealer 的等向听吃
             # 被限到向听 ≤1，**静默改变了基准**（1000 局里 34 局结果不同，both_gate 从 +0.689 掉到 +0.531）。
             # 是冻结基准的「同配置复跑应逐位一致」把它抓出来的 —— 别再往老路径里加隐藏门控。
-            return best_chi(game.hands[seat], tile, nm,
-                            ukeire_gate=True, remain=self._remain(game, seat),
-                            gate_min_gain=self.claim_gate_min_gain,
-                            gate_max_shanten=self.chi_gate_max_shanten,
-                            narrow_max_accept=self.chi_narrow_max_accept,
-                            narrow_min_shanten=self.chi_narrow_min_shanten,
-                            prefer_narrow=self.chi_prefer_narrow)
-        return best_chi(game.hands[seat], tile, nm,
-                        narrow_max_accept=self.chi_narrow_max_accept,
-                        narrow_min_shanten=self.chi_narrow_min_shanten,
-                        prefer_narrow=self.chi_prefer_narrow)
+            combo = best_chi(game.hands[seat], tile, nm,
+                             ukeire_gate=True, remain=self._remain(game, seat),
+                             gate_min_gain=self.claim_gate_min_gain,
+                             gate_max_shanten=self.chi_gate_max_shanten,
+                             narrow_max_accept=self.chi_narrow_max_accept,
+                             narrow_min_shanten=self.chi_narrow_min_shanten,
+                             prefer_narrow=self.chi_prefer_narrow)
+            if combo is not None:
+                return combo
+        else:
+            combo = best_chi(game.hands[seat], tile, nm,
+                             narrow_max_accept=self.chi_narrow_max_accept,
+                             narrow_min_shanten=self.chi_narrow_min_shanten,
+                             prefer_narrow=self.chi_prefer_narrow)
+            if combo is not None:
+                return combo
+        # bao_claim：持白且早巡 → 为了爆头形状放宽吃
+        if self._bao_claim_ready(game, seat):
+            for combo in chi_combos(game.hands[seat], tile):
+                if self._bao_claim_ok(game, seat, tile, combo):
+                    return combo
+        return None
 
     def want_minggang(self, game, seat, tile):
         """明杠（别人弃牌 + 我手上有 3 张）。
@@ -332,21 +465,42 @@ class Smart(Strategy):
         return True  # 明杠加速（杠开 ×2 潜力）
 
     def want_hu(self, game, seat, drawn, gang_kai=False):
-        """弃胡判据（decline_hu=True 时启用）：只在「弃胡打白能续飘且 q>q*」时放弃这个胡。
+        """弃胡判据（decline_hu=True 时启用）：只在 EV 为正时放弃这个胡。
 
-        与线上 smart_bot 共用 mahjong.decision.should_decline_hu（同一判据，避免口径漂移）。
-        返回 False = 弃胡，随后 choose_discard 会打出财神（decision.discard_decision 的财飘优先分支）。
+        与线上 smart_bot 共用 mahjong.decision.decline_plan（同一判据，避免口径漂移）：
+        - 路线 `piao`（财飘）：手里 ≥2 白且打白后仍「任意摸都胡」，链 +1 ⇒ ×2；
+        - 路线 `knock`（敲响，decline_knock=True）：打一张非财神牌后剩下 13 张仍是
+          「任意摸都胡」→ 下一摸必胡 · 爆头 ×2（真机 a_41c78761ce3c_r1_b0_t0 第 6 局的形态）。
+
+        返回 False = 弃胡，并把要打的牌记进 `_decline_pending[seat]` 交给 choose_discard
+        （旧实现只对财飘有效：靠 discard_decision 的财飘分支自己再判一次；敲响必须显式传递）。
         """
         if not self.decline_hu:
             return True
-        chain = game.piao_count[seat]
+        hand = game.hands[seat]
+        nm = len(game.melds[seat])
         d = drawn if drawn is not None else -1
-        if should_decline_hu(game.hands[seat], len(game.melds[seat]), drawn=d,
-                             gang_kai=gang_kai, chain_count=chain,
-                             is_dealer=(game.dealer == seat),
-                             q_est=self.decline_q, max_chain=self.decline_max_chain):
-            return False
-        return True
+        pol = self.dealer_policy
+        piao_eff = self.piao_enabled and not (game.dealer == seat and pol == "aggr_nopiao")
+        plan = decline_plan(hand, nm, drawn=d, gang_kai=gang_kai,
+                            chain_count=game.piao_count[seat],
+                            is_dealer=(game.dealer == seat),
+                            max_chain=self.decline_max_chain,
+                            knock=self.decline_knock,
+                            allow_piao=piao_eff, remain=self._remain(game, seat))
+        if plan is None:
+            return True
+        q = self.decline_knock_q if plan["kind"] == "knock" else self.decline_q
+        if q <= plan["q_star"]:
+            return True
+        self._decline_pending[seat] = (plan["discard"], tuple(hand))
+        self.decline_log.append(dict(seat=seat, kind=plan["kind"], discard=plan["discard"],
+                                     fan_now=plan["fan_now"], fan_next=plan["fan_next"],
+                                     q_star=plan["q_star"], q=q,
+                                     chain=game.piao_count[seat],
+                                     drawn=(d if d is not None else -1),
+                                     draw_pos=game.draw_pos))
+        return False
 
     def _gang_gate_ok(self, game, seat, kind, tile):
         """杠的两条**用户指定**门控（2026-09-25，默认全关）。

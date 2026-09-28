@@ -14,6 +14,7 @@ from .tiles import LAIZI_INDEX, NUM_TILES, is_number, pair_completions
 from .win import split_laizi
 from .fan import _is_four_melds, any_draw_win, calc_fan
 from .shanten import shanten, shanten_baotou
+from .shape import natural_meld_ukeire, isolated_count   # L1 形状项（默认权重 0 = 不起作用）
 from .ukeire import shanten_after_discard, ukeire_quality, ukeire_depth, ukeire_wait_width, \
     unique_tiles, ting_count
 
@@ -52,6 +53,60 @@ D1_WINDOW = None      # 庄家弃牌观察窗口（最近 N 张；None=全部公
 #   edge10 −1.275（z=−3.31）；三档全负、分半同号、剂量越大越差（胡牌率 25.2%→19.4%，只换来场均番 +0.06）。
 #   见 docs/eval-rounds.md §25。默认恒 0.0，别在线上打开。**
 EDGE_W = 0.0
+
+# ---- 并列破平（2026-09-26 用户规则；**只在得分完全相等时生效 = 零牌效损失**）----
+# 用户规则原话：「针对 6789w 或者 124t 这种情况需要拆牌的时候，应该先打 9w 和 1t 这种边张；
+#   在不损失牌效的情况下优先打场上出现过的」。
+# 背景（真机复盘 + 探针：data/_probe_6789*.py / data/_scan_6789_live.py）：
+#   现行代码在**得分精确并列**时取「候选遍历顺序第一个」（见下面 `score < best_score - 1e-9`
+#   那个分支），而线上候选池是 set（小整数按槽位升序迭代）⇒ 6w(索引5) 恒排在 9w(索引8) 前面。
+#   实测：真机归档里「含完整 6789w 且弃 6w」的 **13/13 全是精确并列**（打 6w 与打 9w 的打后向听、
+#   进张集合逐张相同、番型相同）；随机 8000 手里「选 6w」的 89% 也是并列。
+#   ⇒ 「优先打 6w」从来不是策略结论，只是并列时按索引取胜的副作用
+#     （6789w 里 678/789 都等价于「一副顺子 + 一张浮牌」，124t 里 12/24 也都只听 3t）。
+# 与已证否的 EDGE_W 的区别（必须分清）：EDGE_W 是**同向听内的全局减分**，能翻转「进张差 ≤10 张」
+#   的候选 → 三档全负（−0.260/−0.621/−1.275，docs/eval-rounds.md §25）；本破平**只动得分完全相等的
+#   候选**（向听/进张/番型/各项罚分全同），任何真实牌效或番型差异都不会被覆盖。
+# 顺序：tie_visible（场况信息：留不住的牌先打）优先于 tie_edge（形状启发式：边张先打）。
+TIE_VISIBLE = False   # True: 并列时优先打「场上已见张多（remain 小）」的牌
+TIE_EDGE = False      # True: 并列时优先打「边张」（1/9=3、2/8=2、3/7=1；字牌 0，见 edge_bias）
+                      #   注：真机那个 6789w 的并列集合是 {6w, 9w, 8b}（跨门）——「拆牌」只是它的
+                      #   典型来源，不是可判定的独立范围；所以本开关按「并列内谁更靠边」生效。
+
+# ---- 主动追爆头（bao_w / bao_slack，**默认关**；2026-09-22 探针后立项）----
+# 动机（docs/eval-rounds.md §28 + data/_pm_chase_cost.py）：
+#   爆头要求「白当将（4 面子 + 单张白）」，而现行打分把白算成"一个百搭 ≈ 3 番单位 × FAN_W(5) = 15 分"，
+#   远小于 SHANTEN_COST=100 → 只要用白能省一巡，引擎结构性必然花掉白，那手牌从此不能爆头。
+# 实测（10 场 800 局，代价 = 爆头向听 − 标准向听）：
+#   · 「只慢一巡」（代价 1）的机会双方几乎一样多（我 278 局 / 对手 909 局，占带白局的 ~70%）
+#   · 但同样价格下的爆头转化：**我 5.4%（15/278）vs 对手 15.6%（142/909）= 2.9×**
+#   · 代价 ≥2 时双方都无效（0.0% / 0.4%）⇒ 只该追"一巡以内"
+# 打法：给「打掉这张后、白留着当将」的爆头路线一个**显式加分**（score 越小越好 → 减分）：
+#   bonus = max(0, (s_after + bao_slack) − shanten_baotou(c13, melds))，白被花掉时 shanten_baotou=99 → bonus 0
+#   score -= bao_w × bonus
+# 量纲：bao_w=100 ⇒「爆头计划近一巡」正好等于一巡的价值（= 对手那种取舍）；建议档 30/60/100。
+# 注意：这不是 `knock` 那条路（把爆头并进 min 向听 —— 已证恒为 no-op），而是**独立的目标函数项**。
+BAO_W = 0.0
+BAO_SLACK = 1.0
+
+# 追加实测（2026-09-22 深夜）：把 `bao_w` 做成"在现目标上加 bonus"**必然无效** ——
+# 候选之间的 cost = sb − s 几乎是常数（人人都留白、打白走财飘分支提前 return），
+# 与 `god_fan_boost` 同病：80 局 0 翻转。真正能表达"追"的只有**换主项**：
+# 当「白当将」计划只比标准计划差 ≤ bao_max_cost 巡时，主排序项直接换成 sb（见下面 discard_decision）。
+BAO_PLAN = False
+BAO_MAX_COST = 1
+
+# ---- 手级双计划 EV 比较（plan_mode="ev"，**默认 off**；2026-09-22 R20 v2 立项）----
+# 为什么不是再加一个偏置：R20 已证「单步主项切换」是负的（bao_plan −1.105，z=−4.82，番型反降）。
+# 爆头需要**整手牌型的持续承诺**（4 面子全靠真牌 + 白留作将），而单步改动只会为罕见形状牺牲日常效率。
+# 这里改为**手级计划选择**：同一副 14 张上同时算两个计划的"速度 × 进张"并乘上各自的番型倍数，
+# 谁 EV 高就按谁推进（本轮之后每一步都重新评估，因此天然带"承诺"——只要 B 计划还划算就一直走它）。
+#   EV_plan ≈ (有效进张加权 / (1 + 计划向听)) × 该计划的番型倍数
+#   · S 计划：白当百搭（现行 `shanten`），番型倍数 1
+#   · B 计划：白当将（`shanten_baotou`），番型倍数 PLAN_FAN_MULT（爆头 ×2）
+PLAN_MODE = "off"        # "off" | "ev"
+PLAN_FAN_MULT = 2.0      # B 计划成功时的番型倍数
+PLAN_MARGIN = 0.0        # 要求 EV_B > EV_S × (1 + PLAN_MARGIN) 才切到 B
 
 
 def edge_bias(tile: int) -> float:
@@ -128,30 +183,58 @@ def piao_after_discard(hand, melds=0) -> bool:
     return any_draw_win(c, melds)
 
 
-def should_decline_hu(hand, melds=0, drawn=-1, gang_kai=False, chain_count=0,
-                      is_dealer=False, q_est=PIAO_Q_EST, max_chain=PIAO_MAX_CHAIN) -> bool:
-    """能胡时**是否弃胡去打财飘**（规则明确允许的战术，guide §1.2）。
+def _fan_next_any_draw(counts13, melds=0, remain=None):
+    """「任意摸都胡」的 13 张，下一摸结算时的番（取所有进张的最小值 = 保守估计）。
 
-    调用方须已确认这手牌能胡（can_hu）。EV 模型（rules-strategy §2.5，底分 1）：
-
-        EV(弃胡飘) − EV(直接胡) = f0·(2q − 1) − (1 − q)·c
-        ⇒ 盈亏平衡存活率 q* = (f0 + c) / (2·f0 + c)
-
-    f0 = 现在胡的番（爆头 ×2 / 4 白 ×2 / 已有链 ×2^chain 都算进去）
-    c  = 被对手抢先时我方损失（庄家 8、闲家 ≈2.75，按对手番型 1 估）
-    q  = 活过一圈的概率（默认保守取 PIAO_Q_EST=0.75）
-
-    只在**同时**满足「打白后仍爆头」+「q_est > q*」+「连飘未超上限」时才弃胡。
-    典型结果：闲家 f0=2 → q*=0.70 < 0.75 → 飘；庄家 f0=2 → q*=0.83 > 0.75 → 不飘。
-
-    hand: 14-3*melds 张胡牌形；drawn: 刚摸的牌（判「现在这胡算不算爆头」用，-1=未知）。
+    counts13 已满足 any_draw_win（4 面子+财神做将 / 6 对+财神），所以每个进张 t 都是胡牌，
+    逐张 calc_fan(..., baotou=True) 取最小：敲响路线的番是**确定**的（不靠运气），
+    用最小值可避免"赶上豪华七对就当赚"的自欺。
+    remain 给出时只统计还摸得到的牌（None = 全部 34 种）。
     """
-    if chain_count >= max_chain:
-        return False
+    best = None
+    for t in range(NUM_TILES):
+        if remain is not None and remain[t] <= 0:
+            continue
+        c14 = list(counts13)
+        c14[t] += 1
+        if shanten(c14, melds) != -1:
+            continue
+        f = calc_fan(c14, gang_kai=False, piao_count=0, baotou=True)
+        if best is None or f < best:
+            best = f
+    return best
+
+
+def decline_plan(hand, melds=0, drawn=-1, gang_kai=False, chain_count=0, is_dealer=False,
+                 max_chain=PIAO_MAX_CHAIN, knock=False, allow_piao=True, remain=None):
+    """能胡时算「弃胡计划」：返回 dict(kind, discard, fan_now, fan_next, q_star) 或 None。
+
+    规则依据：**弃胡是规则明确允许的战术**（guide §1.2 / R11）。两条路线都是
+    「先不要这个胡，换一个更大的胡」：
+
+    - 路线 `piao`（财飘，原有）：手里 ≥2 财神且**打 1 张白后仍「任意摸都胡」**
+      → 动作链 +1 ⇒ 下一摸的胡 ×2（`chain_count+1`）。
+    - 路线 `knock`（敲响，2026-09-26 新增，`knock=True`）：手里有财神，
+      **打一张非财神牌后剩下 13 张变成「任意摸都胡」**（4 面子+财神做将 / 6 对+财神）
+      → 下一摸**必胡**且按**爆头 ×2** 结算。「留 1 张财神做将/单吊」正是敲响终局，
+      旧代码只算向听（`knock_shanten`），到不了"能胡时要不要弃胡"这一步。
+
+    统一 EV 模型（底分 1，rules-strategy §2.5 的推广）：
+
+        EV(弃胡) − EV(直接胡) = f1·q − (1 − q)·c − f0
+        ⇒ 盈亏平衡存活率 q* = (f0 + c) / (f1 + c)
+
+    f0 = 现在胡的番（爆头 ×2 / 4 白 ×2 / 已有链 ×2^chain / 杠开 ×2 都算进去）
+    f1 = 弃胡后**下一次摸牌**胡的番（敲响 = 爆头 ×2；财飘 = 链 +1）
+    c  = 被对手抢先时我方损失（庄家 8、闲家 ≈2.75，按对手番型 1 估）
+    要求 f1 > f0（否则纯亏风险，不弃）；多条路线时取 f1 最大者，同 f1 优先飘
+    （飘额外封对手一圈，见 guide R6 抓打圈）。
+
+    hand: 14-3*melds 张**胡牌形**（调用方须先确认能胡）；drawn: 刚摸的牌。
+    knock/allow_piao: 路线开关（allow_piao=False 时财飘路线不参与，如 sim 的 piao_enabled）。
+    """
     if shanten(hand, melds) != -1:
-        return False                      # 不是胡牌形 → 谈不上弃胡
-    if not piao_after_discard(hand, melds):
-        return False                      # 打白后链会断 → 纯亏，不弃
+        return None                       # 不是胡牌形 → 谈不上弃胡
     baotou_win = False
     if 0 <= drawn < NUM_TILES and hand[drawn] > 0:
         h13 = list(hand)
@@ -159,12 +242,65 @@ def should_decline_hu(hand, melds=0, drawn=-1, gang_kai=False, chain_count=0,
         baotou_win = any_draw_win(h13, melds)
     fan_now = calc_fan(hand, gang_kai=gang_kai, piao_count=chain_count, baotou=baotou_win)
     loss = PIAO_LOSS_DEALER if is_dealer else PIAO_LOSS_IDLE
-    q_star = (fan_now + loss) / (2.0 * fan_now + loss)
-    return q_est > q_star
+
+    plans = []
+    # 路线 P：财飘（打白，链 +1 ⇒ ×2）
+    if allow_piao and chain_count < max_chain and piao_after_discard(hand, melds):
+        plans.append(dict(kind="piao", discard=LAIZI_INDEX, fan_next=2 * fan_now))
+    # 路线 K：敲响（打非财神，留下「任意摸都胡」的 13 张 ⇒ 下一摸必胡 · 爆头 ×2）
+    if knock and hand[LAIZI_INDEX] >= 1:
+        for d in range(NUM_TILES):
+            if d == LAIZI_INDEX or hand[d] <= 0:
+                continue
+            c13 = list(hand)
+            c13[d] -= 1
+            if not any_draw_win(c13, melds):
+                continue                  # 打完这张不是爆头态 → 不构成敲响
+            f1 = _fan_next_any_draw(c13, melds, remain)
+            if f1 is None or f1 <= fan_now:
+                continue                  # 番没变大 → 只有风险没有收益
+            plans.append(dict(kind="knock", discard=d, fan_next=f1, c13=c13))
+    if not plans:
+        return None
+    # 排序：f1 大者优先；同 f1 时飘优先（抓打圈封锁对手一圈）→ 敲响里选**最不容易被吃碰**的舍牌：
+    # 先比「未见张数」少的（越"死"的牌越难被别人吃/碰），再比幺九/字牌（不能被吃），最后按牌序定死。
+    def _key(p):
+        if p["kind"] == "piao":
+            return (-p["fan_next"], 0, 4.0, 0, 0)
+        d = p["discard"]
+        rm = 4.0 if remain is None else float(remain[d])
+        outside = 0 if (not is_number(d) or d % 9 in (0, 8)) else 1
+        return (-p["fan_next"], 1, rm, outside, d)
+    best = sorted(plans, key=_key)[0]
+    best["fan_now"] = fan_now
+    best["q_star"] = (fan_now + loss) / (best["fan_next"] + loss)
+    best["loss"] = loss
+    return best
+
+
+def should_decline_hu(hand, melds=0, drawn=-1, gang_kai=False, chain_count=0,
+                      is_dealer=False, q_est=PIAO_Q_EST, max_chain=PIAO_MAX_CHAIN,
+                      knock=False, allow_piao=True, remain=None) -> bool:
+    """能胡时**是否弃胡**（财飘 / 敲响，规则明确允许的战术，guide §1.2）。
+
+    调用方须已确认这手牌能胡（can_hu）。EV 模型与盈亏平衡点见 `decline_plan`：
+
+        q* = (f0 + c) / (f1 + c)      # f0 = 现在胡的番, f1 = 弃胡后下一摸胡的番
+        q  = 活过一圈（自己下次摸牌前没人胡）的概率，默认保守取 PIAO_Q_EST=0.75
+
+    - 默认 `knock=False` = **旧行为**（只考虑财飘：≥2 张白、打白后仍爆头）；
+    - `knock=True` 时额外考虑敲响路线（打一张非财神牌后 13 张仍是「任意摸都胡」）。
+    典型结果：闲家 f0=1、敲响 f1=2 → q*=(1+2.75)/(2+2.75)=0.79。
+    """
+    plan = decline_plan(hand, melds, drawn=drawn, gang_kai=gang_kai, chain_count=chain_count,
+                        is_dealer=is_dealer, max_chain=max_chain, knock=knock,
+                        allow_piao=allow_piao, remain=remain)
+    return plan is not None and q_est > plan["q_star"]
 
 
 def should_peng(hand13, peng_tile, melds=0, ukeire_gate=False, remain=None, gate_max_shanten=None,
-                gate_min_gain=0.0) -> bool:
+                gate_min_gain=0.0, bao_live=False, bao_live_max_melds=2, bao_live_slack=1,
+                bao_live_need_white=True, bao_live_need_route=True) -> bool:
     """是否碰：碰后（副露 + 打 1 张）向听数下降才碰。
 
     hand13: 13 张暗手（34 维计数，不含刚摸的）
@@ -176,6 +312,16 @@ def should_peng(hand13, peng_tile, melds=0, ukeire_gate=False, remain=None, gate
                       （限制过早锁面子；None=不限）。
     gate_min_gain: 门控的最小质量增益比例（0=只要有提升就碰）。1.05 = 要求提升 ≥5%，
                    用来过滤「提升一点点就锁面子」的边缘情形。
+
+    **bao_live：形状判据（R7/H-peng，2026-09-23，默认关）**
+    动机（机会对齐对照，20 房 1600 局，`data/_pm_claim_gap_probe.py`）：同样名义碰机会下
+    **我接受 36.9% vs 对手 64.1%（−27.2pp）**，而**我放过的机会里 87.9% 并不亏向听**、
+    只有 49.2% 会亏进张质量 ⇒ 拦下这些形状型碰的是 `ukeire_gate` 这条纯速度判据。
+    判据：`手里有白(bao_live_need_white)` 且 `副露 < bao_live_max_melds` 且
+    存在一张打牌 d 使 `碰后向听 ≤ 现有向听`（不亏速）且 `碰后爆头向听 ≤ 碰后向听 + bao_live_slack`
+    （`bao_live_need_route`，= 爆头路线还活着）→ 碰。
+    爆头形 = (4−m) 自然面子 + 单白 ⇒ 每多一摊、且白仍在，路线就更容易活（teardown §1.1）。
+    阴性对照：`bao_live_slack=-1` 恒不成立（`shanten_baotou ≥ shanten`），用于校验装置。
     """
     s_no = shanten(hand13, melds)
     if hand13[peng_tile] < 2:
@@ -189,6 +335,16 @@ def should_peng(hand13, peng_tile, melds=0, ukeire_gate=False, remain=None, gate
         best = min(best, shanten(c2, melds + 1))
     if best < s_no:
         return True
+    if bao_live and melds < bao_live_max_melds \
+            and (not bao_live_need_white or hand13[LAIZI_INDEX] >= 1):
+        for d in unique_tiles(c):
+            c2 = list(c)
+            c2[d] -= 1
+            s2 = shanten(c2, melds + 1)
+            if s2 > s_no:
+                continue                      # 亏速：不在本判据的范围（保持"不亏向听"）
+            if not bao_live_need_route or shanten_baotou(c2, melds + 1) <= s2 + bao_live_slack:
+                return True
     if ukeire_gate and best == s_no and (gate_max_shanten is None or s_no <= gate_max_shanten):
         # 向听数不变，但碰后进张质量提升也碰（在等向听数的出牌里取质量最高）
         best_q = -1.0
@@ -516,6 +672,83 @@ def _d1_penalty_vector(dealer_discards, hand=None, pen=D1_FEED_PEN, hot_max=D1_H
     return zeros
 
 
+def _draw_quality_bao(counts13, remain=None, melds=0):
+    """「白当将」计划的进张质量 —— 与 `_draw_quality` 同口径，只把向听函数换成 `shanten_baotou`。
+
+    这样两个计划的 EV 才可比（同一单位：牌墙剩余 × 深度权重）。
+    白被花掉（counts13 无白）→ shanten_baotou 返回 99 → 质量 0（自然表达"爆头计划已死"）。
+    """
+    base = shanten_baotou(counts13, melds)
+    if base >= 99:
+        return 0.0
+    if remain is None:
+        remain = [4] * NUM_TILES
+    score = 0.0
+    for t in range(NUM_TILES):
+        if remain[t] <= 0:
+            continue
+        c2 = list(counts13)
+        c2[t] += 1
+        s2 = shanten_baotou(c2, melds)
+        if s2 < base:
+            score += remain[t] * (1 + max(0, 3 - s2))
+    return score
+
+
+def _plan_choice(hand, melds, remain, pool, s_map, fan_mult, margin):
+    """手级双计划 EV 比较：返回 (是否走爆头计划, 爆头计划最优候选 d, sB, uB)。
+
+    EV_plan ≈ 该计划最优 13 张的进张质量 / (1 + max(0, 计划向听)) × 计划番型倍数。
+    S 计划 = 白当百搭（现行 `shanten`，倍数 1）；B 计划 = 白当将（`shanten_baotou`，倍数 fan_mult）。
+    """
+    # S 计划的最优候选（用已有的 s_map）
+    dS = min(pool, key=lambda d: (s_map[d], -_draw_quality(_after(hand, d), remain, melds)))
+    cS = _after(hand, dS)
+    sS = max(0, s_map[dS])
+    uS = _draw_quality(cS, remain, melds)
+    evS = (uS / (1.0 + sS)) * 1.0
+    # B 计划的最优候选
+    sB, dB = 99, None
+    for d in pool:
+        sb = shanten_baotou(_after(hand, d), melds)
+        if sb < sB:
+            sB, dB = sb, d
+    if dB is None or sB >= 99:
+        return False, None, 99, 0.0
+    cB = _after(hand, dB)
+    uB = _draw_quality_bao(cB, remain, melds)
+    evB = (uB / (1.0 + max(0, sB))) * fan_mult
+    return (evB > evS * (1.0 + margin)), dB, sB, uB
+
+
+def _after(hand, d):
+    c = list(hand)
+    c[d] -= 1
+    return c
+
+
+def plan_route(hand, melds=0, *, ycb=False, dealer_speed=False, baotou_slack=1,
+               baotou_max_shanten=1, plan_bao_live=False, plan_bao_live_slack=1,
+               plan_bao_live_max_sb=None, plan_bao_live_min_melds=0):
+    """是否按「财神做将（爆头）」口径打这手牌（= discard_decision 里的 baotou_route）。
+
+    默认口径（冠军）：`sb ≤ s + baotou_slack` **且** `sb ≤ baotou_max_shanten`（=1，很晚才切）。
+    `plan_bao_live`（R7，默认关）：**状态入场** —— 只要「白当将」不比标准慢超过 slack 巡就切，
+    不再要求 `sb ≤ baotou_max_shanten`（即把"最晚入场"这个绝对门换成相对门）。
+    坐庄（dealer_speed）时不生效，避免覆盖坐庄抢速口径。
+    单独抽出来是为了**可测**（见 tests/test_peng_bao.py）：语义能被直接断言，而不必依赖 argmin 是否变。
+    """
+    if ycb or hand[LAIZI_INDEX] < 1:
+        return False
+    s_std = shanten(hand, melds)
+    s_bao = shanten_baotou(hand, melds)
+    if s_bao <= s_std + baotou_slack and s_bao <= baotou_max_shanten:
+        return True
+    return bool(plan_bao_live and not dealer_speed and melds >= plan_bao_live_min_melds
+                and s_bao <= s_std + plan_bao_live_slack
+                and (plan_bao_live_max_sb is None or s_bao <= plan_bao_live_max_sb))
+
+
 def discard_decision(hand, remain=None, melds=0, depth=True, dealer=False, fan_override=True, allowed=None, youcai_bikao=False,
                      piao_enabled=True, piao_dealer_only=False, baotou_slack=1, baotou_max_shanten=1,
                      defend_dealer=False, dealer_discards=None, defend_pen=D1_FEED_PEN,
@@ -524,7 +757,13 @@ def discard_decision(hand, remain=None, melds=0, depth=True, dealer=False, fan_o
                      ycb_escape_gap=0, dealer_speed=False,
                      fan_value_melds=False, wait_width=None, wait_tie_eps=0.0,
                      shanten_cost=SHANTEN_COST, ukeire_w=UKEIRE_W, fan_weight=FAN_W,
-                     god_fan_boost=1.0, edge_w=EDGE_W):
+                     god_fan_boost=1.0, edge_w=EDGE_W, bao_w=BAO_W, bao_slack=BAO_SLACK,
+                     bao_plan=BAO_PLAN, bao_max_cost=BAO_MAX_COST,
+                     plan_mode=PLAN_MODE, plan_fan_mult=PLAN_FAN_MULT, plan_margin=PLAN_MARGIN,
+                     plan_bao_live=False, plan_bao_live_slack=1, plan_bao_live_max_sb=None,
+                     plan_bao_live_min_melds=0, plan_bao_live_cand=False,
+                     shape_nat_w=0.0, shape_iso_w=0.0,
+                     tie_visible=TIE_VISIBLE, tie_edge=TIE_EDGE):
     """出牌决策：返回最优出牌 tile 索引。
 
     优先级：
@@ -572,6 +811,15 @@ def discard_decision(hand, remain=None, melds=0, depth=True, dealer=False, fan_o
         `edge_w × edge_bias(d)`（1/9=3、2/8=2、3/7=1 分），只在同向听内重排。
         这是「中张靠张多于边张，所以先打边张」这一假设的 A/B 开关；与现行「整手牌进张」判据
         可能相反（靠张重叠只算一次），**收益必须由冻结基准配对 A/B 判定**。
+    bao_w / bao_slack: 主动追爆头（**默认 0 = 关**，见模块常量 BAO_W）。>0 时对「白留着当将」的
+        爆头路线加分：`score -= bao_w × max(0, (s_after + bao_slack) − shanten_baotou(c13, melds))`。
+        探针实测：代价 1（爆头只慢一巡）的机会双方一样多（~70% 带白局），但同样价格下爆头转化
+        **我 5.4% vs 对手 15.6%（2.9×）** ⇒ 这是决策差异，值得显式建模；代价 ≥2 双方都无效。
+    tie_visible / tie_edge: **并列破平**（默认全关 = 旧行为，见模块常量 TIE_VISIBLE/TIE_EDGE）。
+        只在两个候选得分**完全相等**（1e-9 内）时换人，即零牌效/番型损失：
+          tie_visible → 优先打「场上已见张多（remain 小，留不住）」的那张；
+          tie_edge    → 优先打「边张」（edge_bias：1/9=3、2/8=2、3/7=1；字牌 0）。
+        两者同时开时 visible 优先（先看场况、再看形状）。与 wait_width="tiebreak" 互斥（后者优先）。
     """
     dealer_mult = 8 if dealer else 1
     if dealer_speed:
@@ -590,12 +838,12 @@ def discard_decision(hand, remain=None, melds=0, depth=True, dealer=False, fan_o
     ycb = youcai_bikao and laizi >= 1  # 有财必拷响且手有财神
 
     # 爆头路线：财神做将（×2）值得牺牲 slack 个向听数（仅非 YouCaiBiKao 模式判断）
-    baotou_route = False
-    if not ycb and laizi >= 1:
-        s_std = shanten(hand, melds)
-        s_bao = shanten_baotou(hand, melds)
-        if s_bao <= s_std + baotou_slack and s_bao <= baotou_max_shanten:
-            baotou_route = True
+    baotou_route = plan_route(hand, melds, ycb=ycb, dealer_speed=dealer_speed,
+                              baotou_slack=baotou_slack, baotou_max_shanten=baotou_max_shanten,
+                              plan_bao_live=plan_bao_live,
+                              plan_bao_live_slack=plan_bao_live_slack,
+                              plan_bao_live_max_sb=plan_bao_live_max_sb,
+                              plan_bao_live_min_melds=plan_bao_live_min_melds)
 
     if allowed is not None:
         pool = [d for d in allowed if hand[d] > 0]
@@ -606,6 +854,20 @@ def discard_decision(hand, remain=None, melds=0, depth=True, dealer=False, fan_o
     # 有财必拷响：财神可打出（逃回平胡）
     if ycb and LAIZI_INDEX not in pool and (allowed is None or LAIZI_INDEX in allowed):
         pool.append(LAIZI_INDEX)
+
+    # ---- R8b：逐候选口径的「状态入场」（默认关，`plan_bao_live_cand`）----
+    # 与 `plan_bao_live` 的区别：后者用**14 张**的 `sb14 ≤ s14+1`（实测只新增 17.4% 触发、且行为惰性），
+    # 这里用**逐候选 13 张**「∃d: sb(打后) ≤ s(打后) + slack」——实测在 m≥1 的持白决策点上有 **98.3%** 成立
+    # ⇒ 效果 = **持白就保留白做将、整手按爆头形推进**（这才是能改变暗手自然结构的大剂量口径）。
+    # 动机（形状探针）：我的暗手自然面子只有 0.45~0.93，任何 m 下「可进爆头听」都是 0%~0.7%。
+    if (plan_bao_live_cand and not baotou_route and not ycb and laizi >= 1
+            and melds >= plan_bao_live_min_melds and not dealer_speed):
+        for d in pool:
+            c = list(hand)
+            c[d] -= 1
+            if shanten_baotou(c, melds) <= shanten(c, melds) + plan_bao_live_slack:
+                baotou_route = True
+                break
 
     # 先算每个候选的打后向听数（只依赖向听，fan 值推迟到 bound 内再算，省 real 版开销）
     s_map = {}
@@ -659,6 +921,11 @@ def discard_decision(hand, remain=None, melds=0, depth=True, dealer=False, fan_o
     best_d = -1
     best_score = None
     tied = []          # wait_width="tiebreak"：并列最优的候选，稍后用「进张×落地听口」破平
+    # ---- 手级双计划选择（plan_mode="ev"，默认关）----
+    use_bao_plan = False
+    if plan_mode == "ev" and hand[LAIZI_INDEX] >= 1:
+        use_bao_plan, _, sB_plan, uB_plan = _plan_choice(hand, melds, remain, pool, s_map,
+                                                         plan_fan_mult, plan_margin)
     for d in pool:
         if s_map[d] > bound:
             continue
@@ -673,7 +940,37 @@ def discard_decision(hand, remain=None, melds=0, depth=True, dealer=False, fan_o
             ukeire_val = ukeire_quality(hand, d, remain, melds)
         else:
             ukeire_val = ukeire_depth(hand, d, remain, melds)
-        score = s_map[d] * shanten_cost - ukeire_val * ukeire_w - fan * fan_w * dealer_mult
+        s_use, u_use = s_map[d], ukeire_val
+        if use_bao_plan:
+            # 走爆头计划：把主项换成「白当将」向听与进张（白被花掉 → 99 → 直接出局）
+            sb_d = shanten_baotou(c, melds)
+            if sb_d >= 99:
+                s_use, u_use = 99, 0.0
+            else:
+                s_use, u_use = sb_d, _draw_quality_bao(c, remain, melds)
+        score = s_use * shanten_cost - u_use * ukeire_w - fan * fan_w * dealer_mult
+        if bao_plan and hand[LAIZI_INDEX] >= 1:
+            # **主动追爆头（换主项版，默认关）**：探针显示「爆头只慢一巡」时对手追 15.6% vs 我 5.4%。
+            # 加 bonus 无效（候选间 cost 近常数）→ 这里在"计划只差 ≤ bao_max_cost 巡"时，
+            # 把主排序项从标准向听换成「白当将」向听 sb，即**按爆头计划推进**。
+            sb = shanten_baotou(c, melds)
+            if sb < 99 and sb > s_map[d] and (sb - s_map[d]) <= bao_max_cost:
+                score += (sb - s_map[d]) * shanten_cost
+        if shape_nat_w or shape_iso_w:
+            # L1 形状软定价（默认 0 = 关）：在同等速度下偏好"能长出自然面子 / 少留孤张"的路线。
+            # 与已证否的 `plan_bao_live_cand`（硬换爆头口径）的区别：不禁止白当百搭，只给"自然结构"定价。
+            # **硬闸**：本项被夹在 ±shanten_cost/2 以内 ⇒ 数学上不可能越过一个向听（保住"速度优先"）。
+            l1 = 0.0
+            if shape_nat_w:
+                l1 -= shape_nat_w * natural_meld_ukeire(c, remain)
+            if shape_iso_w:
+                l1 += shape_iso_w * isolated_count(c)
+            cap = shanten_cost * 0.5
+            if l1 > cap:
+                l1 = cap
+            elif l1 < -cap:
+                l1 = -cap
+            score += l1
         if d1_pen is not None:
             score += d1_pen[d]  # D1：喂庄风险 → 该候选更差（同向听内重排）
         if protect_gang and hand[d] >= 4:
@@ -682,6 +979,14 @@ def discard_decision(hand, remain=None, melds=0, depth=True, dealer=False, fan_o
             # 边张优先（默认关，见 EDGE_W）：score 越小越好 → 给边张减分 = 更想打它。
             # 必须 << shanten_cost，只在同向听候选间重排。
             score -= edge_w * edge_bias(d)
+        if bao_w:
+            # 主动追爆头（默认关，见 BAO_W）：白留着当将的路线越近，越该保它。
+            # c = 打 d 后的 13 张；白被花掉时 shanten_baotou 返回 99 → bonus 0（自然惩罚打白/花白）。
+            sb = shanten_baotou(c, melds)
+            if sb < 99:
+                bonus = (s_map[d] + bao_slack) - sb
+                if bonus > 0:
+                    score -= bao_w * bonus
         if best_score is None or score < best_score - 1e-9:
             best_score = score
             best_d = d
@@ -717,6 +1022,23 @@ def discard_decision(hand, remain=None, melds=0, depth=True, dealer=False, fan_o
     if wait_width == "tiebreak" and len(tied) > 1:
         # P1-a：并列时（实测分歧都发生在并列点）改用「进张 × 落地听口宽度」挑
         best_d = max(tied, key=lambda d: ukeire_wait_width(hand, d, remain, melds))
+    if (tie_visible or tie_edge) and wait_width != "tiebreak" \
+            and best_score is not None and len(tied) > 1:
+        # 并列破平（2026-09-26 用户规则，见模块常量 TIE_VISIBLE/TIE_EDGE）：
+        # **只在与最优分完全相等的候选之间换人** —— 向听/进张/番型/罚分逐项相同，
+        # 所以不可能损失牌效；换的只是「原来由候选顺序（6w 的索引 < 9w）决定」的那一次选择。
+        # 6789w：默认打 6w（顺序），tie_edge=True → 打 9w；124t 同理先打 1t。
+        rem = remain if remain is not None else [4.0] * NUM_TILES
+
+        def _tie_key(d):
+            key = []
+            if tie_visible:
+                key.append(rem[d])          # 场上已见越多（剩得越少）→ 越先打
+            if tie_edge:
+                key.append(-edge_bias(d))   # 越靠边 → 越先打
+            return tuple(key)
+
+        best_d = min(tied, key=_tie_key)    # min 取并列中的第一个 ⇒ 退化为原候选顺序
     return best_d
 
 

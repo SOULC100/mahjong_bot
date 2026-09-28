@@ -34,6 +34,7 @@ CTX.verify_mode = ssl.CERT_NONE
 
 REPORT = io.TextIOWrapper(open(os.path.join(ROOT, "data", "_smoke_report.txt"), "wb"),
                           encoding="utf-8")
+PENDING_DIR = os.path.join(ROOT, "data", "matches", "_pending")
 
 
 def rp(*a):
@@ -77,6 +78,21 @@ def main():
     toks, rid = load_tokens()
     rp("=== 真机烟测 %s ===" % time.strftime("%Y-%m-%d %H:%M:%S"))
     rp("room=%s 令牌数=%d" % (rid, len(toks)))
+    # 测试房也落待归档标记（kind=test，非 auto）：收集器会把它收进 data/matches/<room>/，
+    # 与 auto 房同一套归档口径——「只要打过的房都留档」。
+    try:
+        os.makedirs(PENDING_DIR, exist_ok=True)
+        with open(os.path.join(PENDING_DIR, "%s.json" % rid), "w", encoding="utf-8") as f:
+            json.dump({"room_id": rid, "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                       "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                       "source": "live_smoke", "sources": ["live_smoke"],
+                       "bot_id": None, "log_path": "data/smart_0.log",
+                       "token_file": "data/tokens.txt", "status": "pending", "attempts": 0,
+                       "last_error": None, "note": "kind=test 测试房（live_smoke）"}, f,
+                      ensure_ascii=False, indent=1)
+        rp("已入待归档清单：data/matches/_pending/%s.json" % rid)
+    except Exception as e:
+        rp("落待归档标记失败（不影响烟测）: %r" % (e,))
     st, f = api("GET", "/portal/api/features")
     rp("features: %s %s" % (st, json.dumps(f, ensure_ascii=False)))
 

@@ -18,7 +18,9 @@
 """
 
 import json
+import os
 import ssl
+import subprocess
 import sys
 import threading
 import time
@@ -29,7 +31,7 @@ sys.path.insert(0, ".")
 from mahjong.game_state import GameState
 from mahjong.tiles import tile_from_str, tile_to_str, LAIZI_INDEX
 from mahjong.decision import should_piao, should_peng, best_chi, discard_decision, angang_tile, \
-    should_decline_hu, piao_after_discard
+    should_decline_hu, piao_after_discard, decline_plan
 from mahjong.shanten import shanten, clear_caches
 from mahjong.fan import ycb_can_hu
 
@@ -42,6 +44,25 @@ SERVER = "https://10.240.169.190:18080"
 #       收到 round_ended 后立刻 seq=0 会拿到上一局终态，须把 settled 当「再等一拍」）；
 # v30 = 他人姓名字段收口（零影响）；v29 = 全服功能开关（403 FEATURE_DISABLED）。
 KNOWN_GUIDE_VERSION = 34
+
+
+def dealer_from_scores(prev_scores, cur_scores):
+    """由「累计积分快照」的差分反推**下局庄家**（P0 修复，2026-09-22）。
+
+    返回 `(dealer_or_None, delta)`：差分全 0（流局 / 尚无变化）→ `(None, [0,0,0,0])`，调用方保留原庄家。
+    规则「赢家成为下局庄家、庄家自己赢则续坐；流局连庄」——用 10 场 800 局的归档（`rounds[].scores`
+    与 `rounds[].dealer`）全量验证：**694/694 一致**。
+
+    动机：每次提交动作后 `seq=0` 重拉权威快照会吞掉局末 `round_ended`，实测 **35.7% 的局庄家未知**
+    → `dealer_speed`(+0.29) 与 `D1 防庄`(+0.18) 静默失效。快照的 `scores` 是**本场累计积分**
+    （guide §2.1：settled 快照已含本局得分），两次快照的差就是该局结算，故可精确反推。
+    """
+    if prev_scores is None or not isinstance(cur_scores, list) or len(cur_scores) != 4:
+        return None, None
+    delta = [int(a) - int(b) for a, b in zip(cur_scores, prev_scores)]
+    if not any(delta):
+        return None, delta
+    return max(range(4), key=lambda i: delta[i]), delta
 
 
 def _token_from(spec):
@@ -83,6 +104,52 @@ if not TOKEN:
     raise SystemExit(2)
 LOG = open("data/smart_%s.log" % BOT_ID, "w", encoding="utf-8")
 
+# 命令行里的令牌**来源**（`@data/global_token.txt` 或 `<字面量>`）；只记来源、绝不记明文
+TOKEN_REF = sys.argv[1].strip() if len(sys.argv) > 1 else ""
+
+
+def mark_pending_archive(room):
+    """落「待归档」标记（collect_auto.py 兜底收集器扫它）。
+
+    需求（2026-09-23 用户）：**只要触发自动匹配就要把这场收下来**——所以标记落在 bot 自己身上：
+    不管是谁起的进程（match_session / live_loop / 人肉手跑），入席成功就先留痕，打完再由
+    各入口归档、或由收集器补档（auto 房关停后免认证端点仍可读，2026-09-23 实测）。
+    **绝不抛异常**：收集装置不能影响对局。
+    """
+    try:
+        import json as _json
+        import os as _os
+        d = _os.path.join("data", "matches", "_pending")
+        _os.makedirs(d, exist_ok=True)
+        p = _os.path.join(d, "%s.json" % room)
+        old = {}
+        if _os.path.exists(p):
+            try:
+                with open(p, encoding="utf-8") as f:
+                    old = _json.load(f)
+            except ValueError:
+                old = {}
+        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        token_file = TOKEN_REF[1:].strip() if TOKEN_REF.startswith("@") else None
+        with open(p, "w", encoding="utf-8") as f:
+            _json.dump({"room_id": room,
+                        "created_at": old.get("created_at") or now,
+                        "updated_at": now,
+                        "source": "smart_bot",
+                        "sources": sorted(set((old.get("sources") or []) + ["smart_bot"])),
+                        "bot_id": BOT_ID,
+                        "log_path": old.get("log_path") or ("data/smart_%s.log" % BOT_ID),
+                        "token_file": token_file or old.get("token_file") or "data/global_token.txt",
+                        "status": "pending", "attempts": 0, "last_error": None}, f,
+                       ensure_ascii=False, indent=1)
+        return p
+    except Exception as e:
+        try:
+            log("落待归档标记失败（不影响对局）:", repr(e))
+        except Exception:
+            pass
+        return None
+
 
 # ---- 出牌深度开关 ----
 # True 用二次进张(ukeire_depth，慢但更准，最坏 ~370ms/次)；False 用进张质量
@@ -99,6 +166,15 @@ USE_DEPTH = False
 DECLINE_HU = True     # False = 旧行为（能胡就胡）
 DECLINE_Q = 0.75      # 「活过一圈」存活率估计（rules-strategy §2.5 实测 0.75~0.80）
 DECLINE_MAX_CHAIN = 3  # 连飘上限
+# ---- 弃胡路线 B：敲响（2026-09-26 新增） ----
+# 场景（真机 a_41c78761ce3c_r1_b0_t0 第 6 局）：能胡但现在这胡是平胡 ×1，而**打掉一张非财神牌后
+# 剩下 13 张就是「4 面子 + 财神做将」= 任意摸都胡**（敲响终局）→ 下一摸必胡且按爆头 ×2 结算。
+# 旧代码到不了这个分支：`should_decline_hu` 第一道门是 piao_after_discard（要求手里 ≥2 张白），
+# 只有 1 张白时直接胡 → 白拿一个 ×2 不要。判据与盈亏平衡点见 decision.decline_plan。
+DECLINE_KNOCK = True   # False = 旧行为（1 张白时不弃胡）
+DECLINE_KNOCK_Q = 0.90  # 敲响的「活过一圈」存活率：只需活过 3 个对手行动（下一摸必胡），
+                        # 实测 hazard ≈2.5%/对手行动 → (1−0.025)^3 ≈ 0.93；取 0.90 留余量。
+                        # 见 docs/eval-rounds.md §31（本次 A/B 的实测 q 与配对增量）。
 
 # ---- 鸣牌 ukeire 门控（2026-09-21 冻结基准晋级） ----
 # 含义：向听数**不降**、但「进张质量提升」时也吃/碰（早巡加速成牌）。
@@ -131,6 +207,20 @@ CHI_PREFER_NARROW = True
 # 量纲见 mahjong/decision.py 的 EDGE_W（1/9=3 分、2/8=2 分、3/7=1 分；~0.1 分 ≈ 1 张进张）。
 EDGE_W = 0.0
 
+# ---- 并列破平（2026-09-26 用户规则：拆牌先打边张 + 不损牌效时先打场上已见张）----
+# 用户原话：「针对 6789w 或者 124t 这种情况需要拆牌的时候，应该先打 9w 和 1t 这种边张；
+#   在不损失牌效的情况下优先打场上出现过的」。
+# 与上面 EDGE_W 的**关键区别**：EDGE_W 是同向听内的全局减分（会翻转进张差 ≤10 张的候选，已证否）；
+# 这里只在两个候选**得分完全相等**时换人 → 零牌效损失（判据与量纲见 mahjong/decision.py 的
+# TIE_VISIBLE / TIE_EDGE 注释块，含真机 13/13 并列的证据）。
+# 线上候选池是 set（小整数按槽位升序）⇒ 并列时原来恒取索引小的那张（6789w 恒打 6w）。
+# **实测（冻结基准配对 A/B，强场，base_g）**：发现集 1000 局 tie_vis −0.123(z=−0.72) /
+#   tie_edge −0.090(z=−0.37) / tie_both −0.339(z=−1.25)；确认集 2000 局 +0.001 / +0.026 / +0.164
+#   （全不显著）→ **池化 3000 局三臂 ≈ 0（tie_both −0.004，z≈0）**。
+# 结论：这是**零成本的行为对齐**（用户指定偏好），不是有证据支持的增益；按需可一键回退为 False。
+TIE_VISIBLE = True    # True: 并列时优先打「场上已见张多」的牌
+TIE_EDGE = True       # True: 并列时优先打「边张」（1/9=3、2/8=2、3/7=1）
+
 # ---- 杠的时机（2026-09-25 用户指定两条规则；冻结基准已测，等确认集通过后开启）----
 # ① GANG_TENPAI_ONLY：只有「杠完就听牌」才明杠/补杠 = 杠后补牌存在**杠开 ×2** 的可能。
 #    （暗杠本来就是更严的「摸前听牌 + 杠后仍听」，不受此开关影响）
@@ -151,8 +241,18 @@ GANG_DRAW_WALL = 28        # 残局未听牌时用杠"白摸一张"（弱场 300
 # 无点炮规则里唯一有正 EV 的防守就是**别喂庄**（只有庄家能吃上家弃牌）：
 #   `_d1_penalty_vector` 按庄家公开弃牌估"他还在收集哪门/哪张"，对危险牌加罚分（同向听内重排）。
 # 只在「我 = 庄家上家」且「庄家吃摊未满 2」时启用（与 sim `Smart._d1_active` 同口径）。
-DEFEND_DEALER = True       # 已晋级（三套独立种子池化 5000 局：+0.180 分/局、z=2.18，分半 +0.172/+0.188；
-                           # 逐套 +0.150/+0.141/+0.235；场均番 1.109→1.179）
+DEFEND_DEALER = False      # 【2026-09-23 复核：**关闭**】干净口径（ref = `base_g`，与臂只差这一个键）：
+                           # 三套独立种子**全部为负** —— 发现集 −0.262（z=−2.48）／确认集 −0.045（z=−0.58）／
+                           # 第三套 `seeds_holdout2_2000` −0.035（z=−0.47）；
+                           # **池化 5000 局 −0.084（z=−1.75，分半 −0.120/−0.049 同号），没有任何一次干净测量为正**。
+                           # 当年晋级的 +0.180（z=2.18）是 ref=`base` 的 A 类污染值（净效应 ≈ −0.146，
+                           # 见 `docs/eval-rounds.md` §27.4 / `data/_pm_armaudit.py`）；它也不动番型
+                           # （场均番 1.173 → 1.179）⇒ 对"爆头缺口"无贡献。
+                           # ⇒ 按 `docs/action-plan-2026-09-23.md` §3-R1 的预注册分支「−2 < z < 0 ⇒ 关闭」，
+                           #    记为**判断**（移除无干净正证据的复杂度），不是"已证有害"。
+                           # 复现：python data/eval_report.py --run POOL_r22_all --pool r22_d1,r22_d1_h,r22_d1_h2 \
+                           #         --field strong --base base_g
+                           # 机制开关保留（默认关，不影响任何现有配置）：需要时可一键复测。
 DEFEND_PEN = 40.0          # 罚分（< SHANTEN_COST=100 ⇒ 只在同向听内重排，不牺牲自己的向听）
 DEFEND_MODE = "suit"       # "suit"（整门罚）| "pair"（按"活互补搭子数"细分到牌）
 DEFEND_HOT_MAX = 1         # 观察窗内该门弃牌数 ≤ 该值 → 判庄家可能还在收集该门
@@ -200,6 +300,36 @@ def log(*a):
 # POST 动作稀疏且时间敏感（3s 出牌窗口），不参与限速，避免排队拖垮出牌。
 POLL_INTERVAL = 0.08  # ~12.5/s（+控制面 ≈14.5/s < 16/s 墙）
 _get_lock = threading.Lock()
+
+# ---- R7 诊断（2026-09-23，**只写日志、不改行为**）----
+# 动机：真机归档里我的**碰接受率 36.9%**（540/1464 名义机会），而同一套配置在 sim 里是 **65.7%**；
+# 抓打圈只占 0.60% 的弃牌、碰相关 409 只有 14 条 ⇒ 差额既不是规则也不是拒绝，
+# 可能是**响应窗口（1s）来不及**（少拉一次快照 / GET 限速排队就会静默错过）。
+# 本日志给出每次碰窗口的「决策结果 + 已耗时」，用于判定"没碰"是**策略**还是**窗口丢了**。
+PENG_WIN_LOG = True
+# ⚠️ 这些是**诊断用**的"最近一次他人弃牌"信息。第一版写成了模块级全局，结果是
+# **10 局并发线程共享**、seq 会串味（按 seq 对齐的账本因此不可信）。现在改成挂在**每局的 state 上**
+# （`state.diag_disc_*`），全局这几项只作兜底、不再用于对账。
+_LAST_DISC_T = [0.0]
+_LAST_DISC_TILE = [""]
+_LAST_DISC_SEQ = [0]
+_LAST_DISC_SEAT = [-1]
+
+# ---- R7b 响应路径修复（2026-09-23）：只对「我可能真要动作」的弃牌拉快照 ----
+# 真机实测（`data/_pm_pengwin_log_probe.py` + 归档对拍，2 场 160 局）：
+#   · 名义碰机会（我手里 ≥2 张该弃牌）93 / 84 个；
+#   · 但日志里**只有 49 / 67 个被评估过** ⇒ **20%~47% 的碰窗口从来没被看到**；
+#   · 而"看到了就碰"的比例 59% / 51%（与 sim 的 66% 同量级）⇒ 差距主要在**看不到**，不在判据；
+#   · 决定 PENG 29 / 34 次 vs 归档 peng 事件 29 / 36 ⇒ **提交几乎零损耗**（不是 409/迟到）。
+# ⚠️ **2026-09-23 实测：本条修复未通过验证，已默认关闭。**
+#   同条件 3 场对照（修复前 3 场 240 局 vs 修复后 3 场 240 局）：
+#     被评估的碰窗口 **158 → 105（61.0% → 50.0%，z≈−3.3）**、归档 peng **86 → 68**
+#   ⇒ **省 GET 没有换来更多窗口，反而更少**。原因：拉快照少了 ⇒ 本地状态刷新更少 ⇒
+#     **本地手牌更容易过期** ⇒ 过滤条件本身判错，把本该动作的窗口跳过。
+#   ⇒ 结论：**卡点不在 GET 预算**（省了 ~1900 次/场也没用），而在"窗口本身的可得性/时延"别处。
+#   代码与 `[fetchskip]` 日志保留（`FETCH_SKIP_LOG`）供后续复用。
+CLAIM_FETCH_FILTER = False
+FETCH_SKIP_LOG = True
 _last_get = [0.0]
 
 
@@ -286,7 +416,8 @@ def choose_discard(hand, allowed_set, remain, melds=0, youcai_bikao=False, deale
                             defend_pen=DEFEND_PEN, defend_hot_max=DEFEND_HOT_MAX,
                             defend_window=DEFEND_WINDOW, defend_mode=DEFEND_MODE,
                             ycb_escape_gap=(YCB_ESCAPE_GAP if youcai_bikao else 0),
-                            edge_w=EDGE_W)   # 边张优先：默认 0=关，见 EDGE_W 注释
+                            edge_w=EDGE_W,   # 边张优先：默认 0=关，见 EDGE_W 注释
+                            tie_visible=TIE_VISIBLE, tie_edge=TIE_EDGE)  # 并列破平（零牌效损失）
 
 
 def can_hu(hand, melds=0, youcai_bikao=False, drawn=-1, gang_kai=False):
@@ -390,7 +521,7 @@ def gang_tenpai_ok(hand, tile, melds, kind):
 
 def choose_action(state, phase_info, melds=0, youcai_bikao=False, skip_hu=False,
                   chi_count=None, gang_kai=False, is_dealer=None, skip_piao=False,
-                  skip_gang=False, dealer_seat=None):
+                  skip_gang=False, dealer_seat=None, skip_knock=False):
     """根据局面和当前阶段选择动作。返回动作 dict 或 None。
 
     chi_count: 本人已有吃摊数（v25 服务端强制 ≤2；None = 解析不出，交服务端 409 兜底）。
@@ -398,6 +529,7 @@ def choose_action(state, phase_info, melds=0, youcai_bikao=False, skip_hu=False,
     is_dealer: 本局本人是否庄家；None = 未知（按庄家保守处理，见弃胡判据）。
     skip_piao: 打财神被服务端 409 拒绝后置位——本手牌状态不再打财神（防重提死循环）。
     skip_gang: 明杠/补杠被 409 拒绝后置位——本手牌状态不再提杠（防重提死循环）。
+    skip_knock: 敲响的舍牌被服务端 409 拒绝后置位——本手牌状态回到"能胡就胡"（防重提死循环）。
 
     None 表示「无需提交」：要么非己方动作，要么 pass（碰/吃窗口固定走满，
     不 POST 让服务器自然超时，省请求）。"""
@@ -412,19 +544,32 @@ def choose_action(state, phase_info, melds=0, youcai_bikao=False, skip_hu=False,
         # 1. 能胡就胡（仅当真的摸了牌；碰/吃/杠后 drawn_tile 为空禁止胡；误判被拒后跳过）
         if tile_str and not skip_hu and can_hu(hand, melds, youcai_bikao,
                                                state.drawn_tile, gang_kai):
-            # 1b. 弃胡打财飘（guide §1.2，2026-09-20）：只在「打白后仍爆头」且 q>q* 时才弃；
-            #     判据与 sim/players.Smart.want_hu 共用 mahjong.decision.should_decline_hu。
-            if (DECLINE_HU and not skip_piao and _laizi_discardable(state, restricted)
-                    and should_decline_hu(
-                        hand, melds, drawn=state.drawn_tile, gang_kai=gang_kai,
-                        chain_count=state.piao_count(),
-                        is_dealer=(True if is_dealer is None else bool(is_dealer)),
-                        q_est=DECLINE_Q, max_chain=DECLINE_MAX_CHAIN)):
-                log("弃胡打财飘: chain=%s is_dealer=%s 手牌=%s"
-                    % (state.piao_count(), is_dealer, hand))
-                # 必须显式打财神：discard_decision 的财飘分支只在同一形态下触发，
-                # 而七对形财飘不在 should_piao 里——交给它会有「弃了胡却打别的牌=链断」的风险。
-                return {"action": "discard", "tile": tile_to_str(LAIZI_INDEX)}
+            # 1b. 弃胡（guide §1.2，2026-09-20 起：财飘；2026-09-26 起：+敲响）：
+            #     路线 P 财飘 = 打白续飘（须手里 ≥2 张白）；
+            #     路线 K 敲响 = 打一张非财神牌后 13 张仍是「任意摸都胡」→ 下一摸必胡 · 爆头 ×2。
+            #     判据与 sim/players.Smart.want_hu 共用 decision.decline_plan（同一份代码，防口径漂移）。
+            plan = None
+            if DECLINE_HU and not skip_hu:
+                plan = decline_plan(hand, melds, drawn=state.drawn_tile, gang_kai=gang_kai,
+                                    chain_count=state.piao_count(),
+                                    is_dealer=(True if is_dealer is None else bool(is_dealer)),
+                                    max_chain=DECLINE_MAX_CHAIN,
+                                    knock=DECLINE_KNOCK and not skip_knock,
+                                    remain=state.remain)
+            if plan is not None:
+                q = DECLINE_KNOCK_Q if plan["kind"] == "knock" else DECLINE_Q
+                d = plan["discard"]
+                ok = hand[d] > 0
+                if plan["kind"] == "piao":
+                    # 打白：曾被服务端拒（skip_piao）或抓打圈受限方不能打白 → 这条路线作废
+                    ok = ok and (not skip_piao) and _laizi_discardable(state, restricted)
+                if restricted and d != state.drawn_tile:
+                    ok = False                      # 圈内受限：只能打刚摸的牌
+                if ok and q > plan["q_star"]:
+                    log("弃胡(%s): f%d→f%d q*=%.2f q=%.2f 打%s 手牌=%s is_dealer=%s"
+                        % (plan["kind"], plan["fan_now"], plan["fan_next"], plan["q_star"], q,
+                           tile_to_str(d), hand, is_dealer))
+                    return {"action": "discard", "tile": tile_to_str(d)}
             return {"action": "hu", "tile": ""}
         # 2. 抓打圈受限方：只能打刚摸的牌（跳过杠/财飘/择优）；豁免方不受此限
         if restricted:
@@ -505,7 +650,17 @@ def choose_action(state, phase_info, melds=0, youcai_bikao=False, skip_hu=False,
             return {"action": "gang", "tile": tile_str}
         if should_peng(hand13, t, melds, ukeire_gate=CLAIM_UKEIRE_GATE,
                        remain=state.remain, gate_max_shanten=CLAIM_GATE_MAX_SHANTEN):
+            if PENG_WIN_LOG:
+                log("[pengwin] seq=%s tile=%s hold=%d melds=%d => PENG lat_ms=%d"
+                    % (getattr(state, "diag_disc_seq", 0), tile_str, hand13[t], melds,
+                       int((time.monotonic() - getattr(state, "diag_disc_t", 0.0)) * 1000)
+                       if getattr(state, "diag_disc_t", 0.0) else -1))
             return {"action": "peng", "tile": tile_str}
+        if PENG_WIN_LOG:
+            log("[pengwin] seq=%s tile=%s hold=%d melds=%d => PASS lat_ms=%d"
+                % (getattr(state, "diag_disc_seq", 0), tile_str, hand13[t], melds,
+                   int((time.monotonic() - getattr(state, "diag_disc_t", 0.0)) * 1000)
+                   if getattr(state, "diag_disc_t", 0.0) else -1))
         return None
 
     if phase == "chi":
@@ -530,23 +685,41 @@ def choose_action(state, phase_info, melds=0, youcai_bikao=False, skip_hu=False,
     return None
 
 
-def _needs_snapshot(events, my_seat):
+def _needs_snapshot(events, my_seat, hand13=None, upstream=None):
     """判断一批增量事件里是否含「可能轮到己方动作」的触发，需要拉权威快照。
 
-    触发三类：
-    - tile_drawn(我)：我摸牌，要出牌/胡；
-    - tile_discarded(他人)：碰窗口；
-    - timeout window=peng(我)：我碰窗口走满，吃窗口开启。
+    触发：
+    - tile_drawn(我)：我摸牌，要出牌/胡（**必拉**，也是本地状态的正规刷新点）；
+    - tile_discarded(他人)：碰/吃窗口 —— `CLAIM_FETCH_FILTER` 时先用本地手牌筛一遍（见常量注释）；
+    - timeout window=peng(我)：我碰窗口走满，吃窗口开启（只对**上家**的弃牌拉）。
     """
     for ev in events:
         t = ev.get("type")
         if t == "tile_drawn" and ev.get("seat") == my_seat:
             return True  # 我摸牌 → 出牌/胡
-        if t == "tile_discarded" and ev.get("seat") != my_seat:
-            return True  # 他人弃牌 → 碰窗口
+        if t == "tile_discarded":
+            s = ev.get("seat")
+            if s == my_seat:
+                continue
+            tile = ev.get("tile") or ""
+            if not CLAIM_FETCH_FILTER or tile == "白" or hand13 is None:
+                return True  # 旧行为 / 抓打圈状态变化 / 本地手牌未知（保守）
+            try:
+                hold = hand13[tile_from_str(tile)]
+            except Exception:
+                return True
+            worth = hold >= 2 or (upstream is not None and s == upstream)
+            if worth:
+                return True
+            if FETCH_SKIP_LOG:
+                log("[fetchskip] seq=%s tile=%s hold=%d from=%s upstream=%s"
+                    % (ev.get("seq"), tile, hold, s, upstream))
+            continue
         if (t == "timeout" and ev.get("seat") == my_seat
                 and (ev.get("data") or {}).get("window") == "peng"):
-            return True  # 我碰窗口走满 → 吃窗口
+            # 我碰窗口走满 → 吃窗口开启。加了过滤后：只有上家的弃牌才可能轮到我吃。
+            if not CLAIM_FETCH_FILTER or upstream is None or _LAST_DISC_SEAT[0] == upstream:
+                return True
     return False
 
 
@@ -558,6 +731,7 @@ def play(gid, state, youcai_bikao=False):
     responded_key = None  # 当前响应窗口 key，已响应则不再重复提交
     skip_hu = False  # hu 误判被拒后，本次手牌状态跳过 hu
     skip_piao = False  # 打财神被 409 拒后，本次手牌状态不再打财神（防重提死循环）
+    skip_knock = False  # 敲响舍牌被 409 拒后，本次手牌状态回到「能胡就胡」（防重提死循环）
     skip_gang = False  # 明杠/补杠被 409 拒后，本次手牌状态不再提杠（防重提死循环）
     last_drawn = None
     # 杠开窗口（YCB 免爆头胡法）：杠提交成功即armed，本次摸牌回合内有效；
@@ -570,6 +744,7 @@ def play(gid, state, youcai_bikao=False):
     # 只在「本局是否庄家」这一点上被使用（弃胡判据的 q* 与将来的 dealer_policy）；
     # 万一漏掉 round_ended 事件 → 标 None（未知）并按庄家保守处理，宁可不飘也不误飘。
     cur_dealer = 0
+    prev_scores = None   # 上一快照的累计积分（用于反推局末赢家 → 下局庄家，见下面的庄家恢复）
     round_seen = None
     round_ended_seen = False
     while True:
@@ -596,6 +771,17 @@ def play(gid, state, youcai_bikao=False):
             events = res.get("events") or []
             for ev in events:
                 seq = ev.get("seq", seq)
+                if ev.get("type") == "tile_discarded" and ev.get("seat") != my_seat:
+                    # R7 诊断：记下「他人弃牌」被看到的时刻（碰窗口从这一刻开始计）
+                    # 挂到本局 state 上（**不要用模块全局**：10 局并发会串味）
+                    _LAST_DISC_T[0] = time.monotonic()
+                    _LAST_DISC_TILE[0] = ev.get("tile") or ""
+                    _LAST_DISC_SEQ[0] = ev.get("seq", 0)
+                    _LAST_DISC_SEAT[0] = ev.get("seat", -1)
+                    state.diag_disc_t = _LAST_DISC_T[0]
+                    state.diag_disc_tile = _LAST_DISC_TILE[0]
+                    state.diag_disc_seq = _LAST_DISC_SEQ[0]
+                    state.diag_disc_seat = _LAST_DISC_SEAT[0]
                 if ev.get("type") == "round_ended":  # v19+：data 含 dealer/round_no/scores
                     d_ev = ev.get("data") or {}
                     if d_ev.get("draw"):
@@ -603,21 +789,50 @@ def play(gid, state, youcai_bikao=False):
                     elif ev.get("seat", -1) >= 0:
                         cur_dealer = ev["seat"]                      # 赢家 → 下局坐庄
                     round_ended_seen = True
-            if not _needs_snapshot(events, my_seat):
+            if not _needs_snapshot(events, my_seat,
+                                   hand13=(state.full_hand() if my_seat >= 0 else None),
+                                   upstream=((my_seat - 1) % 4 if my_seat >= 0 else None)):
                 continue
             res0 = api("GET", "/api/games/%s/state?seq=0" % gid)
             seq = res0.get("seq", seq)  # 权威快照的 seq 更新，避免重拉已见事件
             snap = res0.get("snapshot")
+            # R7c 归因日志：这次拉到的快照是什么相位、我在不在响应集里 —— 用来判定「窗口丢失」是
+            # (a) 没拉（轮询没及时看到弃牌）(b) 拉了但相位已过（窗口关了）(c) 相位对但我不在 responding
+            if PENG_WIN_LOG and snap is not None:
+                log("[snap] disc_seq=%s phase=%s turn=%s me_in_responding=%s"
+                    % (getattr(state, "diag_disc_seq", 0), snap.get("phase"),
+                       snap.get("turn"),
+                       (state.my_seat in (snap.get("responding_seats") or []))
+                       if getattr(state, "my_seat", -1) >= 0 else "?"))
         else:
             seq = res.get("seq", seq)
         if snap is None:
             continue
-        # 新一局：若上一局没看到 round_ended（事件被快照吞掉等）→ 庄家未知，按庄家保守处理
+        # ---- 庄家恢复（2026-09-22 修复 P0，见 docs/postmortem-2026-09-22.md）----
+        # 背景：每次提交动作后 seq=0 重拉权威快照，会把局末的 round_ended **吞掉**
+        # （guide §2.1 其实规定 seq=0 只用于 gap:true / 409）→ 实测 **35.7% 的局庄家未知**，
+        # 这些局 `dealer_speed`(+0.29) 与 `D1 防庄`(+0.18) 静默失效。
+        # 修法：快照的 `scores` 是**累计积分**（guide §2.1：settled 快照已含本局得分），
+        # 两次快照的差分即可**精确**反推局末结果：全 0 = 流局（庄家连庄）；否则 argmax = 赢家
+        # （赢家成为下局庄家、庄家自己赢则续坐 —— 真机 2026-09-18 实测口径）。
+        # 与 round_ended 事件路径互为备份：事件看到的以事件为准，事件被吞就靠这里补。
+        cur_scores = snap.get("scores")
+        recovered, delta = dealer_from_scores(prev_scores, cur_scores)
+        if recovered is not None:
+            cur_dealer = recovered
+            log("庄家恢复（快照 scores 差）: 赢家=seat%d delta=%s → 下局庄=%d"
+                % (delta.index(max(delta)), delta, cur_dealer))
+        if isinstance(cur_scores, list) and len(cur_scores) == 4:
+            if prev_scores is not None and list(cur_scores) != prev_scores:
+                round_ended_seen = True   # 等价于观测到 round_ended：别在新局开头把庄家清空
+            prev_scores = [int(x) for x in cur_scores]
+        # 新一局：若上一局既没看到 round_ended、scores 也没变 → 庄家未知，按庄家保守处理
         rn = snap.get("round_no")
         if rn != round_seen:
             if round_seen is not None and not round_ended_seen:
                 cur_dealer = None
-                log("⚠️ 未观测到上局 round_ended → 本局庄家未知（弃胡等庄家敏感策略按庄家保守处理）")
+                log("⚠️ 未观测到上局 round_ended 且 scores 无变化 → 本局庄家未知"
+                    "（弃胡等庄家敏感策略按庄家保守处理）")
             round_seen = rn
             round_ended_seen = False
             # P0-4：新一局开始时清空向听缓存（缓存只影响速度，不影响结果）。
@@ -664,6 +879,7 @@ def play(gid, state, youcai_bikao=False):
             skip_hu = False
             skip_piao = False
             skip_gang = False
+            skip_knock = False
         gang_kai = gang_kai_armed  # 杠开窗口见上方说明
         phase_info = determine_action(snap)
         if phase_info is None:
@@ -678,7 +894,7 @@ def play(gid, state, youcai_bikao=False):
                             chi_count, gang_kai,
                             is_dealer=(state.my_seat == cur_dealer) if cur_dealer is not None else None,
                             skip_piao=skip_piao, skip_gang=skip_gang,
-                            dealer_seat=cur_dealer)
+                            dealer_seat=cur_dealer, skip_knock=skip_knock)
         if act is None:
             continue  # pass 或无需动作：不 POST，窗口自然走满
         log("提交:", json.dumps(act, ensure_ascii=False),
@@ -711,6 +927,11 @@ def play(gid, state, youcai_bikao=False):
                 # 否则下一轮会重新推导出同一个动作 → 重提死循环（历史踩过，见 docs/debug_log.md）
                 skip_piao = True
                 log("打财神被拒 → 本手牌状态关闭财飘")
+            if act["action"] == "discard" and act.get("tile") != tile_to_str(LAIZI_INDEX):
+                # 敲响的舍牌被拒（服务端不认弃胡等）→ 本手牌回到「能胡就胡」，
+                # 否则会一直重提同一张 → 3s 窗口空转（超时服务端自动胡兜底，但会丢掉主动权）
+                skip_knock = True
+                log("敲响舍牌被拒 → 本手牌状态回到能胡就胡")
             log("409 拒绝:", code, json.dumps(act, ensure_ascii=False), e.body[:150])
         seq = 0
 
@@ -847,6 +1068,21 @@ def main():
         if not tid:
             log("未能入席自动匹配房，退出")
             return
+        # 自动匹配 = 必须留档（2026-09-23 用户要求）：入席成功立刻落兜底标记，
+        # 之后无论谁负责归档（match_session / live_loop），漏了都会被 collect_auto.py 收掉。
+        p = mark_pending_archive(tid)
+        log("已入待归档清单：%s（收集器 collect_auto.py）" % (p or "落标记失败"))
+        # 同一时刻把兜底收集器常驻拉起来（幂等，PID 锁在收集器那侧）；
+        # 只在本机存在收集器时才有动作——参赛机上没有这个文件就是纯跳过，不引入任何依赖。
+        _exe = "collect_auto.py"
+        if os.path.exists(_exe):
+            try:
+                _r = subprocess.run([sys.executable, _exe, "ensure"],
+                                    capture_output=True, text=True, encoding="utf-8",
+                                    errors="replace", timeout=60)
+                log("收集器常驻：%s" % ((_r.stdout or "").strip() or _r.returncode))
+            except Exception as _e:
+                log("收集器常驻拉起失败（不影响对局）：%r" % (_e,))
     # 进场：报名 + 到位（幂等）——仅参赛令牌路径。开赛后/阶段确认期返回 409（TOURNAMENT_STARTED 等）
     # 忽略即可（stage_open 的出席确认由下方主循环负责）；403（v24 PORTAL_BINDING_REQUIRED 等永久条件）
     # 也吞掉交主循环按 status 兜底，绝不因一个错误码杀进程。

@@ -43,9 +43,15 @@ import urllib.error
 import urllib.request
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-SERVER = "https://10.240.169.190:18080"
+# 两个环境变量是给自检留的"沙箱开关"（正常跑永远不设）：
+#   COLLECT_SERVER   → 换服务端（自检指向本地假服务端，不碰真服务器）
+#   COLLECT_DATA_DIR → 换数据根（自检在副本上做「破坏→修复」，不碰真归档）
+# 都必须被 READ：只定义不读等于没有（2026-09-23 实测：`MATCHES` 写死 ROOT/data/matches，
+# 沙箱里的补档子进程照样把事件流写进**真归档**，把自检变成了污染源）。
+DATA_DIR = os.environ.get("COLLECT_DATA_DIR") or os.path.join(ROOT, "data")
+SERVER = os.environ.get("COLLECT_SERVER") or "https://10.240.169.190:18080"
 CTX = ssl._create_unverified_context()
-MATCHES = os.path.join(ROOT, "data", "matches")
+MATCHES = os.path.join(DATA_DIR, "matches")
 INDEX = os.path.join(MATCHES, "index.tsv")
 
 # 日志行解析（与 smart_bot.play() 的日志格式绑定；改格式要同步这里）
@@ -53,6 +59,72 @@ RE_SUBMIT = re.compile(r'提交: (\{.*?\}) phase=')
 RE_REJECT = re.compile(r'409 拒绝: (\S+) (\{.*?\}) \{')
 RE_SCORE = re.compile(r'本场结束 积分: (\[[^\]]*\])')
 RE_MATCH = re.compile(r'匹配成功 room=\S+ round_no=\S+ config=(\{.*?\})\s*$', re.M)
+
+# 兜底收集器的标记目录（collect_auto.py 扫它）。这里只依赖标准库，绝不 import 重模块。
+PENDING_DIR = os.path.join(MATCHES, "_pending")
+
+
+def marker(room, source, bot_id=None, log_path=None, token_file=None):
+    """落待归档标记（触发点共用；**绝不抛异常**，不能因为收集装置影响对局）。
+
+    与 `collect_auto.py:write_marker` 同格式：合并已有字段、保留 created_at。
+    归档成功后由 match_session 自己删；失败/中断则留给收集器补。
+    """
+    try:
+        os.makedirs(PENDING_DIR, exist_ok=True)
+        p = os.path.join(PENDING_DIR, "%s.json" % room)
+        old = {}
+        if os.path.exists(p):
+            try:
+                with open(p, encoding="utf-8") as f:
+                    old = json.load(f)
+            except ValueError:
+                old = {}
+        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"room_id": room,
+                       "created_at": old.get("created_at") or now,
+                       "updated_at": now,
+                       "source": source,
+                       "sources": sorted(set((old.get("sources") or []) + [source])),
+                       "bot_id": bot_id or old.get("bot_id"),
+                       "log_path": log_path or old.get("log_path"),
+                       "token_file": token_file or old.get("token_file") or "data/global_token.txt",
+                       "status": "pending", "attempts": 0, "last_error": None}, f,
+                      ensure_ascii=False, indent=1)
+        return p
+    except Exception:
+        return None
+
+
+def clear_marker(room):
+    """归档确认完成后清标记（删不掉不影响任何事）。"""
+    try:
+        os.remove(os.path.join(PENDING_DIR, "%s.json" % room))
+        return True
+    except OSError:
+        return False
+
+
+def ensure_collector(interval=300):
+    """确保兜底收集器**常驻**在跑（幂等：收集器自己有 PID 锁，重复调只会有一个实例）。
+
+    用户定的规则：**下次触发自由匹配时自动开始收集**——所以常驻不由开机项拉起，而是在这里
+    （真打起来的那一刻）拉。走 `ensure` 子命令而不是自己 Popen，是为了让"是否已在跑"只有
+    收集器一个权威判断处。失败只打印一行，**绝不影响对局**。
+    """
+    exe = os.path.join(ROOT, "collect_auto.py")
+    if not os.path.exists(exe):
+        return False
+    try:
+        r = subprocess.run([sys.executable, exe, "ensure", "--interval", str(interval)],
+                           cwd=ROOT, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=60)
+        print("  收集器常驻：%s" % ((r.stdout or "").strip() or r.returncode))
+        return r.returncode == 0
+    except Exception as e:
+        print("  收集器常驻拉起失败（不影响对局）：%r" % (e,))
+        return False
 
 
 # ---------------------------------------------------------------- HTTP
@@ -176,11 +248,19 @@ def room_snapshot(token, room):
 
 
 def fetch_events(room, outdir):
-    """拉 /api/test-rooms/{room}/games 与每场事件流 → 落盘。返回 (games, 取到数, 失败说明)。"""
+    """拉 /api/test-rooms/{room}/games 与每场事件流 → 落盘。返回 (games, 取到数, 失败说明)。
+
+    注意：**网络层失败也算失败**（`api` 返回 status 0）。旧版在 `games` 为空时直接
+    `return [], 0, "..."` 但把那条说明当"没成"却不影响退出码，且 `--require-complete` 只看
+    场次数（0 场 == 0 解析）→「服务器根本没连上」会被当成补档成功（2026-09-23 沙箱自检抓到）。
+    """
     st, payload = api("GET", "/api/test-rooms/%s/games" % room, tries=3, quiet=True)
     games = payload.get("games") if isinstance(payload, dict) else None
+    if st != 200:
+        return [], 0, "games 列表请求失败（HTTP %s / %s）" % (st, str(payload)[:120])
     if not games:
-        return [], 0, "games 列表不可用（HTTP %s / %s）" % (st, str(payload)[:120])
+        # 200 但没有任何场次：房还没开赛（registering）或已被清理
+        return [], 0, "games 列表为空（status=%s）" % (payload or {}).get("status")
     with open(os.path.join(outdir, "games.json"), "w", encoding="utf-8") as f:
         json.dump(games, f, ensure_ascii=False, indent=1)
     evdir = os.path.join(outdir, "events")
@@ -478,11 +558,22 @@ def stats_markdown(stat):
     return "\n".join(lines)
 
 
-def finalize(room, outdir, meta, token, uid=None):
-    """归档（会话元数据 + 房间快照 + 事件流）并产出 stats.json / stats.md / index 行。"""
+def finalize(room, outdir, meta, token, uid=None, keep_marker_on_fail=False):
+    """归档（会话元数据 + 房间快照 + 事件流）并产出 stats.json / stats.md / index 行。
+
+    返回 `(stat, fetch_state)`：`fetch_state` = {"attempted": 抓过事件流吗, "failures": 失败明细}
+    —— 供 `--require-complete` 判定"这次补档到底成没成"（列表 0 场时只看场次数会漏判）。
+
+    `keep_marker_on_fail=True`（补档路径用）：事件流没抓全时**保留**兜底标记，让收集器下轮再来。
+    否则会出现「补档失败 + 标记已清 = 再也没人管」的静默丢档（2026-09-23 真机实测踩到：
+    房还在 registering 时补档 → 标记被清 → 收集器不再重试）。
+    """
     games, ok, fail = fetch_events(room, outdir)
     meta["events_failures"] = fail
     meta["events_fetched"] = ok
+    complete = (not fail) and (bool(games) and ok >= len(games))
+    fetch_state = {"attempted": True, "failures": fail, "games": len(games), "fetched": ok,
+                   "complete": complete}
     meta["end_snapshot"] = room_snapshot(token, room) if token else None
     if not uid and token:
         st, me = api("GET", "/api/me", token, tries=3, quiet=True)
@@ -499,7 +590,13 @@ def finalize(room, outdir, meta, token, uid=None):
     with open(os.path.join(outdir, "stats.md"), "w", encoding="utf-8") as f:
         f.write(stats_markdown(stat))
     append_index(stat)
-    return stat
+    if complete or not keep_marker_on_fail:
+        # 归档既然成了，就把兜底标记清掉（收集器不再重复扫；清不掉也只是多扫一次 SKIP）
+        clear_marker(room)
+    else:
+        print("  ! 事件流未抓全（%s/%s 场，缺件：%s）→ 保留待归档标记，交收集器重试"
+              % (ok, len(games), fail or "-"))
+    return stat, fetch_state
 
 
 def append_index(stat):
@@ -539,6 +636,12 @@ def session_once(args, token, meta_common):
     os.makedirs(outdir, exist_ok=True)
     bot_id = args.bot_id or ("gm-%s" % time.strftime("%Y%m%d-%H%M%S"))
     log_src = os.path.join(ROOT, "data", "smart_%s.log" % bot_id)
+    # 兜底收集标记（collect_auto.py）：**入席即落**——本进程后面无论正常归档、被 Ctrl-C、
+    # 还是机器重启，收集器都能凭这个标记把这场补归档（房间关停后免认证端点仍可读，2026-09-23 实测）。
+    marker(room, "match_session", bot_id=bot_id,
+           log_path=os.path.relpath(log_src, ROOT), token_file=args.token_file)
+    # 自动匹配既已触发 → 顺手把兜底收集器常驻拉起来（幂等；用户规则「下次触发自由匹配时自动开始收集」）
+    ensure_collector()
     meta = dict(meta_common)
     meta.update({"room_id": room, "config": config, "round_no": round_no,
                  "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -559,8 +662,10 @@ def session_once(args, token, meta_common):
     print("bot 退出 code=%s，用时 %.1f 分钟 → 立刻归档事件流" % (code, (time.time() - t0) / 60.0))
     if os.path.exists(log_src):
         shutil.copy2(log_src, os.path.join(outdir, "bot.log"))
-    stat = finalize(room, outdir, meta, token)
-    print("归档完成：%s" % os.path.relpath(outdir, ROOT))
+    stat, fetch_state = finalize(room, outdir, meta, token, keep_marker_on_fail=True)
+    print("归档完成：%s（事件流 %s/%s 场%s）"
+          % (os.path.relpath(outdir, ROOT), fetch_state["fetched"], fetch_state["games"],
+             "" if fetch_state["complete"] else "，未抓全 → 保留待归档标记交收集器补"))
     return stat
 
 
@@ -577,6 +682,8 @@ def main():
     ap.add_argument("--archive", default=None, metavar="ROOM",
                     help="只给已打完的房间补档（不重打）；可配 --log 做 chi 对拍")
     ap.add_argument("--log", default=None, help="补档时用的 bot 日志（默认 data/smart_gm.log）")
+    ap.add_argument("--require-complete", action="store_true",
+                    help="补档时要求事件流完整（有缺件 → 非零退出，供收集器重试）")
     args = ap.parse_args()
 
     token_file = args.token_file if os.path.isabs(args.token_file) else os.path.join(ROOT, args.token_file)
@@ -594,6 +701,10 @@ def main():
         room = args.archive.strip()
         outdir = os.path.join(MATCHES, room)
         os.makedirs(outdir, exist_ok=True)
+        # 补档也是「这场归档的入口」→ 先落标记再干活：万一这次补档中途挂了，收集器还能再补
+        marker(room, "match_session:archive", bot_id=None,
+               log_path=os.path.relpath(args.log or os.path.join(ROOT, "data", "smart_gm.log"), ROOT),
+               token_file=args.token_file)
         meta = dict(meta_common)
         meta.update({"room_id": room, "started_at": None, "ended_at": time.strftime("%Y-%m-%d %H:%M:%S"),
                      "duration_s": None, "exit_code": None, "backfilled": True,
@@ -603,10 +714,16 @@ def main():
         log_src = os.path.join(ROOT, meta["log_path"])
         if os.path.exists(log_src):
             shutil.copy2(log_src, os.path.join(outdir, "bot.log"))
-        stat = finalize(room, outdir, meta, token)
+        stat, fetch_state = finalize(room, outdir, meta, token, keep_marker_on_fail=True)
         print("补档完成：%s（净分 %+d、局数 %d、chi 对拍 %s）"
               % (os.path.relpath(outdir, ROOT), stat["me"]["net_score"], stat["rounds"]["total"],
                  "✅" if (stat["verify"]["chi_tiles_parity"] or {}).get("ok") else "❌/未做"))
+        if args.require_complete and not fetch_state["complete"]:
+            # 两种"不全"都算没成：① 有明确抓取失败（房间进行中 403 / 网络）；② 列表比解析多（缺件）。
+            # 标记已在 finalize 里保留 → 收集器下轮还会再来。
+            print("!! 事件流不完整（抓全 %s 场 / 列表 %s 场；缺件：%s）→ 退出码 3，交由收集器重试"
+                  % (fetch_state["fetched"], fetch_state["games"], fetch_state["failures"] or "-"))
+            return 3
         return 0
 
     for i in range(max(1, args.sessions)):

@@ -75,10 +75,10 @@
   "plan_bao_live_slack": 1,
   "plan_bao_live_max_sb": null,
   "plan_bao_live_min_melds": 0,
-  "tie_visible": true,
-  "tie_edge": true
+  "tie_visible": false,
+  "tie_edge": false
  },
  "version_id": "e173ab5b84",
  "promoted_at_round": "r21",
- "note": "2026-09-26 手动晋级 decline_knock=true / decline_knock_q=0.90（弃胡敲响）：能胡时若打一张非财神牌后 13 张仍「任意摸都胡」→ 下一摸必胡 · 爆头 ×2。真机现场 a_41c78761ce3c_r1_b0_t0 第 6 局；判据 mahjong.decision.decline_plan；配对 A/B（同 seed，弱场 3×Baseline）见 docs/eval-rounds.md §30。 || 2026-09-26 用户规则晋级 tie_visible/tie_edge=true（并列破平：拆牌先打边张 + 不损牌效时先打场上已见张）：只在两个候选**得分完全相等**时换人 ⇒ 零牌效损失；冻结基准配对 A/B 池化 3000 局 ≈ 0（发现集 −0.339/z=−1.25 → 确认集 +0.164/z=0.84，均不显著）= 零成本的行为对齐、不是增益，见 docs/eval-rounds.md §31。"
+ "note": "2026-09-26 手动晋级 decline_knock=true / decline_knock_q=0.90（弃胡敲响）：能胡时若打一张非财神牌后 13 张仍「任意摸都胡」→ 下一摸必胡 · 爆头 ×2。真机现场 a_41c78761ce3c_r1_b0_t0 第 6 局；判据 mahjong.decision.decline_plan；配对 A/B（同 seed，弱场 3×Baseline）见 docs/eval-rounds.md §30。"
 }

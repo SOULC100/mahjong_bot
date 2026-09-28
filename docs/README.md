@@ -20,11 +20,13 @@ mahjong_bot/
 │   └── infer.py        # 牌墙剩余估算（uniform/empirical/suji 对手建模）
 ├── sim_run.py          # 模拟器 CLI（跑 N 局出胡牌率/平均分/番型）
 ├── sim_ab.py           # A/B 对比（相同牌墙隔离吃/碰/杠开关）
+├── sim_ab_knock.py     # **敲响弃胡** A/B：同 seed 配对（base=只财飘 / cand=+敲响），逐局归因 + 配对 z
 ├── smart_bot.py        # 正式参赛 Bot（CLI + 协议循环 + 决策接入 + 版本自检）
 ├── match_session.py    # 自由对战一场到底：入席 → 打 → 归档（元数据/日志/事件流）→ 赛后统计
 ├── match_stats.py      # 自由对战跨场汇总（读 data/matches/*/stats.json）
 ├── explain_round.py    # 复盘任意一局：重建手牌 + 线上判据重算每次出牌并对拍
 ├── why_discard.py      # 拆解某一手：各候选打掉后的真实进张（张数/质量）逐张列出
+├── why_knock.py        # 复盘某一局：白板事件 + 每巡「普通/爆头/敲响向听」+ 实际出牌 vs knock 判据重算
 ├── discard_ledger.py   # 两个候选的进张按花色分项做差（「留 A 换到什么、丢掉什么」）
 ├── live_loop.py        # 自动续赛 driver（逐波拉起 smart_bot + 归档）
 ├── live_smoke.py       # 真机烟测编排：4 令牌开一轮 → 并发 4 bot → 归档 + 日志扫描
@@ -35,18 +37,28 @@ mahjong_bot/
 ├── replay_validate.py  # 离线回放验证
 ├── tests/              # 单元测试
 │   ├── test_smart_bot.py  # 协议层回归（YCB 判胡/吃摊≤2/抓打圈豁免/play 全链路）
+│   ├── test_knock_decline.py # 弃胡敲响（真机第 6 局形态/爆头不再弃/财飘不受影响/线上+sim 接线/不变量）
 │   └── ...             # 内核测试（fan/shanten/win/ukeire/chi/sim/ycb/dealer）
 ├── docs/               # 文档
 │   ├── guide-v34.txt   # 接入指南权威正文（GET /portal/api/guide?format=text）
 │   ├── rules-strategy.md  # 规则研究 + 收益模型 + 迭代方向（P0：弃胡/财飘、抓打圈、明杠）
 │   ├── roadmap.md      # 迭代路线 + 规则版本 §5（v34 审计、修复清单、真机结果、§2 E 新主线）
-│   └── debug_log.md    # 调试记录（§九 版本漂移审计、§十 真机联调）
+│   ├── eval-rounds.md  # **迭代台账与判定纪律**（§25 边张优先证否 / §26 真机期间禁本地重负载 /
+│   │                   #   §27 A/B 臂必须与 base 同底 / §28 追爆头四轮证否 / §29 双计划 EV 否证 /
+│   │                   #   §30 弃胡敲响：同 seed 配对 + 触发率/实测 q）
+│   ├── postmortem-2026-09-22.md  # 10 场 800 局真机复盘（主口径 + 逐条复现判定）
+│   ├── live-data-2026-09-23.md   # **20 场 1600 局数据整理**（逐场表/分队列/显著性/×4/D1）
+│   ├── HANDOFF.md                # **新窗口交接简报**（状态一页纸 + 纪律 + 未决 + 粘贴即用开场词）
+│   ├── opp-baotou-teardown.md    # 对手爆头路线逆向工程（789/789 重建、162/162 标签一致）
+│   ├── plan-commit-design.md     # **R21 设计稿**：手级双计划 + 多巡承诺（未实现）
+│   ├── strategy-current.md  # 当前策略/参数总表（含 §3.13 边际进张、§4 参数）
+│   └── debug_log.md    # 调试记录（§九 版本漂移、§十 真机联调、§十二~§十八 审计与实验留档）
 └── data/               # 令牌、真实对局 events、日志、抓取产物
 ```
 
-> 🧹 **工作区清理**：无引用的一次性产物搬进 `_attic/`（**不是删除**，`MANIFEST.tsv` 记原路径，
-> 整目录删掉即可；`.gitignore` 已忽略）。流程与判定口径见 docs/debug_log.md §十五，
-> 工具：`data/_cleanup_audit.py`（审计）→ `data/_cleanup_apply.py [--dry-run]`（搬移+台账）→
+> 🧹 **工作区清理**：无引用的一次性产物按用户决定**已直接删除**（原 `_attic/` 暂存区已移除，
+> `.gitignore` 仍忽略 `_attic/`）。流程与判定口径见 docs/debug_log.md §十五，
+> 工具：`data/_cleanup_audit.py`（审计）→ `data/_cleanup_apply.py [--dry-run]`（搬移/删除+台账）→
 > `data/_cleanup_verify.py`（校验「文档提到的 data/ 路径是否都还在 + 关键入口能否跑」）。
 > 铁律：`data/eval/**`（实验证据）与 `data/matches/**`（对局归档）永远不动。
 
@@ -107,12 +119,19 @@ mahjong_bot/
 python match_session.py                 # 一场：入席 → 打 → 归档 → 统计（约 15 分钟）
 python match_session.py --sessions 3    # 连打三场（每场一个新 auto 房）
 python match_session.py --archive ROOM  # 只给已打完的房间补档（不重打）
+python collect_auto.py            # 兜底收集：把待归档标记里的房全部收掉（见 docs/auto-collect.md）
+python collect_auto.py watch --interval 300   # 常驻收集（真机连场期间挂上）
 python match_stats.py                   # 跨场汇总（净分/胡牌率/番型/超时/chi 对拍）
 python match_stats.py --csv out.csv     # 每场一行导出
 python explain_round.py ROOM BATCH R    # 复盘某局：重建手牌 + 线上判据重算每次出牌（含对拍）
 python why_discard.py ROOM BATCH R 巡数 # 拆解某一手：各候选的真实进张张数/质量逐张列出
 python discard_ledger.py ROOM BATCH R 巡数 A B   # 两个候选的进张按花色做差（留 A 换到什么/丢掉什么）
 ```
+
+**自动收集（2026-09-23 起）**：入席成功即落标记 `data/matches/_pending/<room>.json`
+（四个触发点：`match_session.py` / `smart_bot.py` / `live_loop.py` / `live_smoke.py`），
+`collect_auto.py` 扫标记 → 校验归档完整性 → 缺件就补档 → 清标记。
+也就是说**只要触发过自动匹配，赛果就不会因为忘了手动归档而丢**；设计与自检命令见 `docs/auto-collect.md`。
 
 **前置**：`data/global_token.txt` 放门户「我的 AI 身份」签发的全局令牌（令牌也支持
 `python smart_bot.py @data/global_token.txt <编号>` 形式，不进 argv/进程列表）。
@@ -124,12 +143,13 @@ python discard_ledger.py ROOM BATCH R 巡数 A B   # 两个候选的进张按花
 | `session.json` | 房规、起止时间、令牌指纹（**不存明文**）、退出码、入席/终局房间快照 |
 | `bot.log` / `bot.stdout.log` | bot 完整日志 / 子进程输出 |
 | `games.json` | 场次列表（batch / game_id / round / status） |
-| `events/b<N>.json` | 每场完整事件流（四家手牌、逐局得分、动作与超时），**房关停后取不到** |
+| `events/b<N>.json` | 每场完整事件流（四家手牌、逐局得分、动作与超时）；**关停后玩家 API 404，但免认证端点仍长期可读**（2026-09-23 对已关 3 小时的房实测 200/150KB+） |
 | `stats.json` / `stats.md` | 赛后统计（结构化 / 人读）：净分名次、逐场四家得分、我的胡牌明细（番+番型）、
 副露与吃摊合规、出牌超时率、chi `tiles` 对拍 |
 
 `data/matches/index.tsv` 是全场次索引（一行一场）。两个坑已内建处理：
-① auto 房 finished 后约 60s 关停 → 归档紧跟 bot 退出执行；② 免认证数据端点 per-room 限速 5/s → 取事件流按 0.25s 间隔并 429 退避。
+① auto 房 finished 后约 60s 关停 → 归档仍紧跟 bot 退出执行（**越早越稳**：平台随时可能清理，
+清理后是 `NOT_FOUND: no such batch`）；② 免认证数据端点 per-room 限速 5/s → 取事件流按 0.25s 间隔并 429 退避。
 补档场次（房间已关）的房规与时长分别从**日志的匹配行**和**事件流时间戳**恢复。
 
 实测样本（room `a_5b83c31e82d3`，M=10 × 8 局）：我胡 19/80（23.8%）、净分 −49、场均番 1.105、
@@ -137,7 +157,9 @@ python discard_ledger.py ROOM BATCH R 巡数 A B   # 两个候选的进张按花
 
 ## 决策引擎策略（优先级从高到低）
 
-1. **能胡就胡**（有财必拷响 YouCaiBiKao 下须**真·爆头**（摸前 13 张任意摸都胡）或**杠开**——判据 `mahjong.fan.ycb_can_hu`，与 `sim/engine._can_win` 同源）；**例外：弃胡打财飘**（`DECLINE_HU`，只在「打白后仍爆头」且 q>q\* 时触发，2026-09-20 落地）
+1. **能胡就胡**（有财必拷响 YouCaiBiKao 下须**真·爆头**（摸前 13 张任意摸都胡）或**杠开**——判据 `mahjong.fan.ycb_can_hu`，与 `sim/engine._can_win` 同源）；**例外：弃胡**（`DECLINE_HU`，判据 `mahjong.decision.decline_plan`，只在换到的番更大且 q>q\* 时触发）——
+   ① 财飘路线（≥2 张白，打白后仍爆头，链 +1；2026-09-20 落地）；
+   ② **敲响路线**（`DECLINE_KNOCK`，1 张白也行：打一张非财神牌后 13 张仍是「任意摸都胡」→ 下一摸**必胡**且**爆头 ×2**；2026-09-26 落地，`docs/eval-rounds.md` §30）
 2. **杠**：`wall_remaining > 20`（最后 10 墩禁杠）+ 财神不能杠。**2026-09-21 起线上做全三种**：
    暗杠（听牌才杠，`angang_tile`）、**明杠**（响应窗口手里 3 张，优先于碰）、**补杠**（自己回合已碰 + 第 4 张）。
    门控由冻结基准决定「不加门控最好」（关掉明杠 −0.161 分/局）；配 `skip_gang` poison pill 防 409 重提

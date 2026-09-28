@@ -21,6 +21,9 @@ EXCLUDE = {"cheat", "remain_mode"}
 # 注：decline_hu / decline_q / decline_max_chain（弃胡+财飘，2026-09-20）**不进 ACTIVE**：
 #     机会频率只有 0~4 次/千局，A/B 分辨不出（会被当噪声随机游走）→ 作为固定部署开关，
 #     由 opt/champion.json 显式带上，保证离线评估与线上 DECLINE_HU 同口径。
+#     同理（2026-09-26）：decline_knock / decline_knock_q（弃胡**敲响**，机会 ≈37 次/千局）
+#     也不进 ACTIVE —— 它是"能胡时换一个更大的胡"的决策层开关，不是可爬的连续旋钮；
+#     由 champion 显式带上（否则 schema 默认 False ≠ 线上 DECLINE_KNOCK=True）。
 ACTIVE = ["use_chi", "use_peng", "use_gang", "fast", "use_ev", "dealer_policy", "fan_est",
           "angang_tenpai_only", "protect_gang", "knock", "piao_enabled",
           "baotou_slack", "baotou_max_shanten", "gang_keep_pen",

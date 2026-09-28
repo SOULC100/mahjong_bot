@@ -82,11 +82,25 @@ def main():
                 if seat == me and tile in hand:
                     hand.remove(tile)
             elif t in ("chi", "peng", "gang"):
-                got = ([x for x in (d.get("tiles") or []) if x != tile] if t == "chi"
-                       else [tile, tile] if t == "peng"
-                       else {"ming": [tile] * 3, "bu": [tile], "an": [tile] * 4}.get(d.get("kind"), []))
+                # ⚠️ 2026-09-22 修复（docs/postmortem-2026-09-22.md 发现）：鸣牌必须把被消耗的牌从
+                # **我的手牌**里摘掉，否则有副露的局（占 66%）候选表全错；且补杠不新增面子数。
+                # 全量对拍 75.18% → 99.24%（参照实现：data/_pm_rounds.py 的 replay()）。
+                if t == "chi":
+                    got = [x for x in (d.get("tiles") or []) if x != tile]
+                    meld_n[seat] += 1
+                elif t == "peng":
+                    got = [tile, tile]
+                    meld_n[seat] += 1
+                else:
+                    k = d.get("kind")
+                    got = {"ming": [tile] * 3, "bu": [tile], "an": [tile] * 4}.get(k, [])
+                    if k != "bu":          # 补杠：原碰已计一个面子
+                        meld_n[seat] += 1
                 melds[seat].extend(got)
-                meld_n[seat] += 1
+                if seat == me:
+                    for x in got:
+                        if x in hand:
+                            hand.remove(x)
         if target_hand is not None:
             break
     if target_hand is None:
